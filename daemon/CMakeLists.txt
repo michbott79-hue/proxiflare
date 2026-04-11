@@ -101,7 +101,21 @@ target_compile_options(proxiflare-daemon PRIVATE
 )
 
 # ── Test executable ──────────────────────────────────────────────────────────
-add_executable(test_config tests/test_config.c)
-target_include_directories(test_config PRIVATE
+add_executable(pf-test-config tests/test_config.c src/config.c vendor/cJSON/cJSON.c)
+target_include_directories(pf-test-config PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/cJSON
+    ${SQLITE3_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIRS}
+    ${ARGON2_INCLUDE_DIR}
+)
+target_link_directories(pf-test-config PRIVATE
+    ${SQLITE3_LIBRARY_DIRS}
+    ${OPENSSL_LIBRARY_DIRS}
+)
+target_link_libraries(pf-test-config PRIVATE
+    ${SQLITE3_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${ARGON2_LIB}
 )

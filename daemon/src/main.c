@@ -399,9 +399,52 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     if (fd >= 0) {
         pf_log_info("tproxy: connected via proxy '%s' (%s:%d) to %s:%d",
                     proxy.name, proxy.host, proxy.port, target, dst_port);
+
+        /* Broadcast log entry to subscribed IPC clients */
+        pf_log_entry_t log_entry;
+        memset(&log_entry, 0, sizeof(log_entry));
+        log_entry.ts       = time(NULL);
+        log_entry.rule_id  = rule->id;
+        log_entry.proxy_id = proxy.id;
+        log_entry.action   = PF_ACTION_PROXY;
+        log_entry.success  = 1;
+        if (match_domain && match_domain[0])
+            snprintf(log_entry.domain, sizeof(log_entry.domain), "%s", match_domain);
+        if (dst_ip && dst_ip[0])
+            snprintf(log_entry.dst_ip, sizeof(log_entry.dst_ip), "%s", dst_ip);
+        log_entry.dst_port = (uint16_t)dst_port;
+        /* Store the proxy name in app_path to surface it in the log UI */
+        snprintf(log_entry.app_path, sizeof(log_entry.app_path), "%s", proxy.name);
+
+        cJSON *event = pf_logger_log(&ctx->logger, &log_entry);
+        if (event) {
+            pf_ipc_broadcast_log(&ctx->ipc, event);
+            cJSON_Delete(event);
+        }
     } else {
         pf_log_error("tproxy: failed to connect via proxy '%s' (%s:%d) to %s:%d",
                      proxy.name, proxy.host, proxy.port, target, dst_port);
+
+        /* Broadcast failed connection log entry */
+        pf_log_entry_t log_entry;
+        memset(&log_entry, 0, sizeof(log_entry));
+        log_entry.ts       = time(NULL);
+        log_entry.rule_id  = rule->id;
+        log_entry.proxy_id = proxy.id;
+        log_entry.action   = PF_ACTION_PROXY;
+        log_entry.success  = 0;
+        if (match_domain && match_domain[0])
+            snprintf(log_entry.domain, sizeof(log_entry.domain), "%s", match_domain);
+        if (dst_ip && dst_ip[0])
+            snprintf(log_entry.dst_ip, sizeof(log_entry.dst_ip), "%s", dst_ip);
+        log_entry.dst_port = (uint16_t)dst_port;
+        snprintf(log_entry.app_path, sizeof(log_entry.app_path), "%s", proxy.name);
+
+        cJSON *event = pf_logger_log(&ctx->logger, &log_entry);
+        if (event) {
+            pf_ipc_broadcast_log(&ctx->ipc, event);
+            cJSON_Delete(event);
+        }
     }
 
     return fd;

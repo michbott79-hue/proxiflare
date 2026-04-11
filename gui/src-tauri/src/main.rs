@@ -40,6 +40,13 @@ fn main() {
             commands::dns_leak_status,
             commands::list_system_apps,
         ])
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let client = app.state::<DaemonClient>();
+            // Start dedicated background connection for push events (log, stats)
+            client.start_event_listener(handle);
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 // Send shutdown to daemon — cleans up nftables, cgroups, proxy routes

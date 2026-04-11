@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tauri::{AppHandle, Emitter};
 
 const SOCKET_PATH: &str = "/run/proxiflare/proxiflare.sock";
 
@@ -106,5 +107,85 @@ impl DaemonClient {
         } else {
             Ok(outer)
         }
+    }
+
+    /// Starts a background thread that opens a SECOND, dedicated connection to the daemon,
+    /// subscribes to log events, and emits them as Tauri events.
+    /// This avoids any contention with the request/response stream.
+    pub fn start_event_listener(&self, app: AppHandle) {
+        // Open a dedicated connection just for push events
+        let mut event_stream = match UnixStream::connect(SOCKET_PATH) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[proxiflare] event listener: cannot connect to daemon: {}", e);
+                return;
+            }
+        };
+
+        // Send log.subscribe on this dedicated connection
+        let sub_req = json!({"id": 0, "method": "log.subscribe", "params": {}});
+        let mut sub_msg = serde_json::to_string(&sub_req).unwrap_or_default();
+        sub_msg.push('\n');
+        if event_stream.write_all(sub_msg.as_bytes()).is_err() {
+            eprintln!("[proxiflare] event listener: failed to send log.subscribe");
+            return;
+        }
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf: Vec<u8> = Vec::with_capacity(8192);
+            let mut byte = [0u8; 1];
+
+            loop {
+                match event_stream.read(&mut byte) {
+                    Ok(0) => {
+                        eprintln!("[proxiflare] event listener: daemon closed connection");
+                        break;
+                    }
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            if let Ok(line) = std::str::from_utf8(&buf) {
+                                if let Ok(json_val) = serde_json::from_str::<Value>(line) {
+                                    // Push events have an "event" field and no numeric id
+                                    let is_push = json_val.get("event").is_some()
+                                        && !json_val.get("id").and_then(|v| v.as_u64()).is_some();
+
+                                    if is_push {
+                                        let event_type = json_val["event"]
+                                            .as_str()
+                                            .unwrap_or("unknown");
+                                        let data = json_val
+                                            .get("data")
+                                            .cloned()
+                                            .unwrap_or(Value::Null);
+
+                                        match event_type {
+                                            "log.entry" => {
+                                                let _ = app.emit("log-entry", &data);
+                                            }
+                                            "stats.update" => {
+                                                let _ = app.emit("stats-update", &data);
+                                            }
+                                            "proxy.status" => {
+                                                let _ = app.emit("proxy-status", &data);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    // else: it's the subscribe response (id=0) — discard
+                                }
+                            }
+                            buf.clear();
+                        } else {
+                            buf.push(byte[0]);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[proxiflare] event listener: read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
     }
 }

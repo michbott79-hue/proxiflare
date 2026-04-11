@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -786,6 +787,15 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             pf_rule_t r;
             rule_from_json(&r, params);
             if (pf_config_rule_update(&ctx->config, &r) == PF_OK) {
+                /* Sync cgroup + nft mark for app-based rules */
+                if (r.app_path[0] && r.enabled && r.action != PF_ACTION_DIRECT) {
+                    pf_cgroup_create_rule((int)r.id);
+                    pf_nft_add_cgroup_mark((int)r.id);
+                } else {
+                    /* Disabled or no app — remove cgroup mark */
+                    pf_nft_remove_cgroup_mark((int)r.id);
+                    pf_cgroup_remove_rule((int)r.id);
+                }
                 pf_rules_load(ctx->ruleset, &ctx->config);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
@@ -1180,6 +1190,82 @@ static int epoll_del(int epfd, int fd)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * MITM handshake thread — runs SSL handshakes without blocking epoll loop
+ *
+ * The thread makes fds blocking, does SSL_connect + SSL_accept, then
+ * makes fds non-blocking again and registers them in the main epoll.
+ * If handshake fails, the connection proceeds without MITM (passthrough).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    pf_mitm_t       *mitm;
+    pf_connection_t *conn;
+    int              epoll_fd;
+    int              slot;
+    pf_tproxy_t     *tproxy;
+} mitm_thread_arg_t;
+
+static void *mitm_handshake_thread(void *arg_raw)
+{
+    mitm_thread_arg_t *arg = (mitm_thread_arg_t *)arg_raw;
+    pf_connection_t *c = arg->conn;
+    int fl;
+
+    /* Set blocking + timeout for handshake */
+    fl = fcntl(c->proxy_fd, F_GETFL, 0);
+    fcntl(c->proxy_fd, F_SETFL, fl & ~O_NONBLOCK);
+    fl = fcntl(c->client_fd, F_GETFL, 0);
+    fcntl(c->client_fd, F_SETFL, fl & ~O_NONBLOCK);
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* 1. Connect TLS to real server (via proxy tunnel) */
+    c->server_ssl = pf_mitm_wrap_server(arg->mitm, c->proxy_fd, c->domain);
+    if (c->server_ssl) {
+        /* 2. Accept TLS from client (present fake cert) */
+        c->client_ssl = pf_mitm_wrap_client(arg->mitm, c->client_fd, c->domain);
+        if (c->client_ssl) {
+            c->inspect = true;
+            pf_log_info("mitm: INSPECT active for %s:%d", c->domain, c->dst_port);
+        } else {
+            SSL_free(c->server_ssl);
+            c->server_ssl = NULL;
+            pf_log_warn("mitm: client wrap failed for %s (passthrough)", c->domain);
+        }
+    } else {
+        pf_log_warn("mitm: server wrap failed for %s (passthrough)", c->domain);
+    }
+
+    /* Restore non-blocking + clear timeout */
+    struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
+    fl = fcntl(c->proxy_fd, F_GETFL, 0);
+    fcntl(c->proxy_fd, F_SETFL, fl | O_NONBLOCK);
+    fl = fcntl(c->client_fd, F_GETFL, 0);
+    fcntl(c->client_fd, F_SETFL, fl | O_NONBLOCK);
+    setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+    setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+
+    /* Register fds in epoll — thread-safe for EPOLL_CTL_ADD */
+    if (c->active) {
+        struct epoll_event ev;
+        ev.events  = EPOLLIN;
+        ev.data.fd = c->client_fd;
+        epoll_ctl(arg->epoll_fd, EPOLL_CTL_ADD, c->client_fd, &ev);
+        ev.data.fd = c->proxy_fd;
+        epoll_ctl(arg->epoll_fd, EPOLL_CTL_ADD, c->proxy_fd, &ev);
+    }
+
+    free(arg);
+    return NULL;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * PID file
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -1493,65 +1579,46 @@ int main(int argc, char *argv[])
                     if (slot >= 0 && ctx->tproxy.conns[slot].active) {
                         pf_connection_t *c = &ctx->tproxy.conns[slot];
 
-                        /* MITM TLS interception: if enabled and connection is TLS,
-                         * wrap both sides in SSL for decrypted inspection.
-                         * SSL handshakes require BLOCKING fds — temporarily switch,
-                         * then back to non-blocking for epoll relay. */
-                        if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
-                            /* Set blocking for SSL handshake */
-                            {
-                                int fl;
-                                fl = fcntl(c->proxy_fd, F_GETFL, 0);
-                                fcntl(c->proxy_fd, F_SETFL, fl & ~O_NONBLOCK);
-                                fl = fcntl(c->client_fd, F_GETFL, 0);
-                                fcntl(c->client_fd, F_SETFL, fl & ~O_NONBLOCK);
-                            }
+                        /* For non-TLS HTTP with inspect enabled, set inspect flag
+                         * and register immediately — no handshake needed */
+                        if (ctx->mitm.enabled && !c->is_tls) {
+                            c->inspect = true;
+                            epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
+                            epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
+                        }
+                        /* MITM TLS interception: spawn a thread for the SSL handshake
+                         * to avoid blocking the main epoll loop (which would starve
+                         * DNS NFQUEUE and freeze all browsing). The thread does the
+                         * handshake, then registers fds in epoll when done. */
+                        else if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
+                            mitm_thread_arg_t *arg = malloc(sizeof(mitm_thread_arg_t));
+                            if (arg) {
+                                arg->mitm     = &ctx->mitm;
+                                arg->conn     = c;
+                                arg->epoll_fd = ctx->epoll_fd;
+                                arg->slot     = slot;
+                                arg->tproxy   = &ctx->tproxy;
 
-                            /* Set timeout for SSL handshake (5s) */
-                            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-                            setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                            setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-                            setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                            setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-                            c->server_ssl = pf_mitm_wrap_server(&ctx->mitm, c->proxy_fd, c->domain);
-                            if (c->server_ssl) {
-                                c->client_ssl = pf_mitm_wrap_client(&ctx->mitm, c->client_fd, c->domain);
-                                if (c->client_ssl) {
-                                    c->inspect = true;
-                                    pf_log_info("mitm: INSPECT active for %s:%d",
-                                                c->domain, c->dst_port);
+                                pthread_t tid;
+                                if (pthread_create(&tid, NULL, mitm_handshake_thread, arg) == 0) {
+                                    pthread_detach(tid);
+                                    /* DON'T register in epoll yet — thread will do it */
                                 } else {
-                                    SSL_free(c->server_ssl);
-                                    c->server_ssl = NULL;
-                                    pf_log_warn("mitm: client TLS wrap failed for %s", c->domain);
+                                    free(arg);
+                                    /* Fallback: register without MITM */
+                                    epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
+                                    epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                                 }
                             } else {
-                                pf_log_warn("mitm: server TLS wrap failed for %s", c->domain);
-                            }
-
-                            /* Restore non-blocking + clear timeout */
-                            {
-                                int fl;
-                                struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
-                                fl = fcntl(c->proxy_fd, F_GETFL, 0);
-                                fcntl(c->proxy_fd, F_SETFL, fl | O_NONBLOCK);
-                                fl = fcntl(c->client_fd, F_GETFL, 0);
-                                fcntl(c->client_fd, F_SETFL, fl | O_NONBLOCK);
-                                setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
-                                setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
-                                setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
-                                setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+                                epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
+                                epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                             }
                         }
-                        /* For non-TLS HTTP with inspect enabled, also set inspect flag */
-                        else if (ctx->mitm.enabled && !c->is_tls) {
-                            c->inspect = true;
+                        /* No MITM — register normally */
+                        else {
+                            epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
+                            epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                         }
-
-                        /* Register both fds in main epoll for relay */
-                        epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
-                        epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                     }
                     continue;
                 }

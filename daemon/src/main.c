@@ -168,6 +168,7 @@ static cJSON *proxy_to_json(const pf_proxy_t *p)
     cJSON_AddStringToObject(obj, "host",       p->host);
     cJSON_AddNumberToObject(obj, "port",       p->port);
     cJSON_AddStringToObject(obj, "username",   p->username);
+    cJSON_AddStringToObject(obj, "password",   p->password);
     cJSON_AddStringToObject(obj, "health",     pf_health_str(p->health));
     cJSON_AddNumberToObject(obj, "latency_ms", (double)p->latency_ms);
     cJSON_AddBoolToObject  (obj, "enabled",    p->enabled);

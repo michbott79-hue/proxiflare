@@ -1,0 +1,409 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import type { Rule, RuleAction, Proxy, Chain } from '../lib/types';
+import * as api from '../lib/api';
+
+const ACTIONS: RuleAction[] = ['DIRECT', 'PROXY', 'CHAIN', 'BLOCK', 'REJECT'];
+
+const ACTION_COLORS: Record<RuleAction, string> = {
+  DIRECT: 'bg-[#64748b]/20 text-[#94a3b8]',
+  PROXY: 'bg-[#6366f1]/20 text-[#818cf8]',
+  CHAIN: 'bg-[#a855f7]/20 text-[#c084fc]',
+  BLOCK: 'bg-[#ef4444]/20 text-[#f87171]',
+  REJECT: 'bg-[#f59e0b]/20 text-[#fbbf24]',
+};
+
+const MATCH_BADGE = {
+  app: 'bg-[#3b82f6]/20 text-[#60a5fa]',
+  domain: 'bg-[#22c55e]/20 text-[#4ade80]',
+  ip: 'bg-[#f59e0b]/20 text-[#fbbf24]',
+  port: 'bg-[#06b6d4]/20 text-[#22d3ee]',
+};
+
+interface ModalState {
+  open: boolean;
+  rule: Partial<Rule> | null;
+}
+
+const EMPTY_RULE: Partial<Rule> = {
+  name: '',
+  enabled: true,
+  priority: 100,
+  match_app: '',
+  match_domain: '',
+  match_ip: '',
+  match_port: '',
+  action: 'DIRECT',
+  proxy_id: undefined,
+  chain_id: undefined,
+};
+
+export default function Rules() {
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [proxies, setProxies] = useState<Proxy[]>([]);
+  const [chains, setChains] = useState<Chain[]>([]);
+  const [modal, setModal] = useState<ModalState>({ open: false, rule: null });
+  const [saving, setSaving] = useState(false);
+  const dragItem = useRef<number | null>(null);
+  const dragOver = useRef<number | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [r, p, c] = await Promise.all([
+        api.ruleList(),
+        api.proxyList(),
+        api.chainList(),
+      ]);
+      setRules(r);
+      setProxies(p);
+      setChains(c);
+    } catch {
+      // Daemon not connected
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleSave() {
+    if (!modal.rule) return;
+    setSaving(true);
+    try {
+      if ('id' in modal.rule && modal.rule.id !== undefined) {
+        await api.ruleEdit(modal.rule as Rule);
+      } else {
+        await api.ruleAdd(modal.rule as Omit<Rule, 'id'>);
+      }
+      setModal({ open: false, rule: null });
+      await load();
+    } catch (e) {
+      console.error('Save rule error:', e);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete(id: number) {
+    try {
+      await api.ruleDelete(id);
+      await load();
+    } catch (e) {
+      console.error('Delete rule error:', e);
+    }
+  }
+
+  async function handleToggle(rule: Rule) {
+    try {
+      await api.ruleEdit({ ...rule, enabled: !rule.enabled });
+      await load();
+    } catch (e) {
+      console.error('Toggle rule error:', e);
+    }
+  }
+
+  function handleDragStart(idx: number) {
+    dragItem.current = idx;
+  }
+
+  function handleDragEnter(idx: number) {
+    dragOver.current = idx;
+  }
+
+  async function handleDragEnd() {
+    if (dragItem.current === null || dragOver.current === null) return;
+    if (dragItem.current === dragOver.current) return;
+
+    const reordered = [...rules];
+    const [removed] = reordered.splice(dragItem.current, 1);
+    reordered.splice(dragOver.current, 0, removed);
+
+    setRules(reordered);
+    dragItem.current = null;
+    dragOver.current = null;
+
+    try {
+      await api.ruleReorder(reordered.map(r => r.id));
+    } catch (e) {
+      console.error('Reorder error:', e);
+      await load();
+    }
+  }
+
+  function updateModal(field: string, value: unknown) {
+    setModal(prev => ({
+      ...prev,
+      rule: prev.rule ? { ...prev.rule, [field]: value } : null,
+    }));
+  }
+
+  function getProxyName(id: number | undefined) {
+    if (id === undefined) return '';
+    return proxies.find(p => p.id === id)?.name || `Proxy #${id}`;
+  }
+
+  function getChainName(id: number | undefined) {
+    if (id === undefined) return '';
+    return chains.find(c => c.id === id)?.name || `Chain #${id}`;
+  }
+
+  return (
+    <div>
+      {/* Top bar */}
+      <div className="mb-4 flex items-center gap-3">
+        <button
+          onClick={() => setModal({ open: true, rule: { ...EMPTY_RULE } })}
+          className="rounded-md bg-[#6366f1] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#818cf8]"
+        >
+          Add Rule
+        </button>
+      </div>
+
+      {/* Rules table */}
+      {rules.length === 0 ? (
+        <div className="flex h-64 items-center justify-center text-[#64748b]">
+          <div className="text-center">
+            <p className="text-lg">No rules configured</p>
+            <p className="mt-1 text-sm">Add a rule to control traffic routing</p>
+          </div>
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-[#2d3348]">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-[#2d3348] bg-[#232733] text-left text-xs text-[#64748b]">
+                <th className="px-4 py-2.5 font-medium">#</th>
+                <th className="px-4 py-2.5 font-medium">Name</th>
+                <th className="px-4 py-2.5 font-medium">Match</th>
+                <th className="px-4 py-2.5 font-medium">Action</th>
+                <th className="px-4 py-2.5 font-medium">Target</th>
+                <th className="px-4 py-2.5 font-medium">Enabled</th>
+                <th className="px-4 py-2.5 font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rules.map((rule, idx) => (
+                <tr
+                  key={rule.id}
+                  draggable
+                  onDragStart={() => handleDragStart(idx)}
+                  onDragEnter={() => handleDragEnter(idx)}
+                  onDragEnd={handleDragEnd}
+                  onDragOver={e => e.preventDefault()}
+                  className="border-b border-[#2d3348] bg-[#1a1d27] transition-colors hover:bg-[#232733] cursor-grab active:cursor-grabbing"
+                >
+                  <td className="px-4 py-2.5 text-[#64748b]">{rule.priority}</td>
+                  <td className="px-4 py-2.5 font-medium">{rule.name}</td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex flex-wrap gap-1">
+                      {rule.match_app && (
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${MATCH_BADGE.app}`}>
+                          App: {rule.match_app}
+                        </span>
+                      )}
+                      {rule.match_domain && (
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${MATCH_BADGE.domain}`}>
+                          Domain: {rule.match_domain}
+                        </span>
+                      )}
+                      {rule.match_ip && (
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${MATCH_BADGE.ip}`}>
+                          IP: {rule.match_ip}
+                        </span>
+                      )}
+                      {rule.match_port && (
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${MATCH_BADGE.port}`}>
+                          Port: {rule.match_port}
+                        </span>
+                      )}
+                      {!rule.match_app && !rule.match_domain && !rule.match_ip && !rule.match_port && (
+                        <span className="text-[10px] text-[#64748b]">All traffic</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <span className={`rounded px-2 py-0.5 text-[10px] font-semibold ${ACTION_COLORS[rule.action]}`}>
+                      {rule.action}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 text-[#64748b]">
+                    {rule.action === 'PROXY' ? getProxyName(rule.proxy_id) : ''}
+                    {rule.action === 'CHAIN' ? getChainName(rule.chain_id) : ''}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <button
+                      onClick={() => handleToggle(rule)}
+                      className={`relative h-5 w-9 rounded-full transition-colors ${
+                        rule.enabled ? 'bg-[#6366f1]' : 'bg-[#2d3348]'
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+                          rule.enabled ? 'translate-x-4' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setModal({ open: true, rule: { ...rule } })}
+                        className="text-xs text-[#64748b] transition-colors hover:text-[#e2e8f0]"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => handleDelete(rule.id)}
+                        className="text-xs text-[#ef4444] transition-colors hover:text-[#f87171]"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Add/Edit modal */}
+      {modal.open && modal.rule && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-lg border border-[#2d3348] bg-[#1a1d27] p-6 shadow-2xl">
+            <h2 className="mb-4 text-lg font-semibold">
+              {modal.rule.id ? 'Edit Rule' : 'Add Rule'}
+            </h2>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-3 gap-3">
+                <div className="col-span-2">
+                  <label className="mb-1 block text-xs text-[#64748b]">Name</label>
+                  <input
+                    type="text"
+                    value={modal.rule.name || ''}
+                    onChange={e => updateModal('name', e.target.value)}
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Priority</label>
+                  <input
+                    type="number"
+                    value={modal.rule.priority ?? 100}
+                    onChange={e => updateModal('priority', parseInt(e.target.value) || 0)}
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Match App</label>
+                  <input
+                    type="text"
+                    value={modal.rule.match_app || ''}
+                    onChange={e => updateModal('match_app', e.target.value)}
+                    placeholder="e.g. firefox"
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Match Domain</label>
+                  <input
+                    type="text"
+                    value={modal.rule.match_domain || ''}
+                    onChange={e => updateModal('match_domain', e.target.value)}
+                    placeholder="e.g. *.google.com"
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Match IP</label>
+                  <input
+                    type="text"
+                    value={modal.rule.match_ip || ''}
+                    onChange={e => updateModal('match_ip', e.target.value)}
+                    placeholder="e.g. 10.0.0.0/8"
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Match Port</label>
+                  <input
+                    type="text"
+                    value={modal.rule.match_port || ''}
+                    onChange={e => updateModal('match_port', e.target.value)}
+                    placeholder="e.g. 80,443"
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs text-[#64748b]">Action</label>
+                <select
+                  value={modal.rule.action || 'DIRECT'}
+                  onChange={e => updateModal('action', e.target.value)}
+                  className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                >
+                  {ACTIONS.map(a => (
+                    <option key={a} value={a}>{a}</option>
+                  ))}
+                </select>
+              </div>
+
+              {modal.rule.action === 'PROXY' && (
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Proxy</label>
+                  <select
+                    value={modal.rule.proxy_id ?? ''}
+                    onChange={e => updateModal('proxy_id', e.target.value ? parseInt(e.target.value) : undefined)}
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                  >
+                    <option value="">Select proxy...</option>
+                    {proxies.map(p => (
+                      <option key={p.id} value={p.id}>{p.name} ({p.host}:{p.port})</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {modal.rule.action === 'CHAIN' && (
+                <div>
+                  <label className="mb-1 block text-xs text-[#64748b]">Chain</label>
+                  <select
+                    value={modal.rule.chain_id ?? ''}
+                    onChange={e => updateModal('chain_id', e.target.value ? parseInt(e.target.value) : undefined)}
+                    className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                  >
+                    <option value="">Select chain...</option>
+                    {chains.map(c => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setModal({ open: false, rule: null })}
+                className="rounded-md border border-[#2d3348] bg-[#232733] px-4 py-2 text-sm text-[#64748b] transition-colors hover:text-[#e2e8f0]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={saving || !modal.rule.name}
+                className="rounded-md bg-[#6366f1] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#818cf8] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

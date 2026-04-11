@@ -35,6 +35,17 @@
 #include <cJSON.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * Log ring buffer — last 500 entries, sequence-numbered for polling
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define PF_LOG_RING_SIZE 500
+
+static cJSON   *g_log_ring[PF_LOG_RING_SIZE];
+static int      g_log_ring_head  = 0;   /* next write position */
+static int      g_log_ring_count = 0;
+static uint64_t g_log_seq        = 0;   /* monotonic sequence number */
+
+/* ──────────────────────────────────────────────────────────────────────────
  * Global context
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -419,6 +430,18 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
         cJSON *event = pf_logger_log(&ctx->logger, &log_entry);
         if (event) {
             pf_ipc_broadcast_log(&ctx->ipc, event);
+
+            /* Store in ring buffer with sequence number for polling */
+            cJSON *copy = cJSON_Duplicate(event, 1);
+            if (copy) {
+                cJSON_AddNumberToObject(copy, "seq", (double)(++g_log_seq));
+                if (g_log_ring[g_log_ring_head])
+                    cJSON_Delete(g_log_ring[g_log_ring_head]);
+                g_log_ring[g_log_ring_head] = copy;
+                g_log_ring_head = (g_log_ring_head + 1) % PF_LOG_RING_SIZE;
+                if (g_log_ring_count < PF_LOG_RING_SIZE) g_log_ring_count++;
+            }
+
             cJSON_Delete(event);
         }
     } else {
@@ -443,6 +466,18 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
         cJSON *event = pf_logger_log(&ctx->logger, &log_entry);
         if (event) {
             pf_ipc_broadcast_log(&ctx->ipc, event);
+
+            /* Store in ring buffer with sequence number for polling */
+            cJSON *copy = cJSON_Duplicate(event, 1);
+            if (copy) {
+                cJSON_AddNumberToObject(copy, "seq", (double)(++g_log_seq));
+                if (g_log_ring[g_log_ring_head])
+                    cJSON_Delete(g_log_ring[g_log_ring_head]);
+                g_log_ring[g_log_ring_head] = copy;
+                g_log_ring_head = (g_log_ring_head + 1) % PF_LOG_RING_SIZE;
+                if (g_log_ring_count < PF_LOG_RING_SIZE) g_log_ring_count++;
+            }
+
             cJSON_Delete(event);
         }
     }
@@ -820,6 +855,24 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         cJSON_AddBoolToObject  (r, "enabled",    strcmp(enabled, "true") == 0);
         cJSON_AddStringToObject(r, "dns_server", server);
         cJSON_AddItemToObject  (resp, "result", r);
+
+    /* ── log.recent ─────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "log.recent") == 0) {
+        int since_seq = 0;
+        cJSON *since = params ? cJSON_GetObjectItem(params, "since_seq") : NULL;
+        if (since) since_seq = (int)since->valuedouble;
+
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < g_log_ring_count; i++) {
+            int idx = (g_log_ring_head - g_log_ring_count + i + PF_LOG_RING_SIZE) % PF_LOG_RING_SIZE;
+            if (g_log_ring[idx]) {
+                cJSON *seq_item = cJSON_GetObjectItem(g_log_ring[idx], "seq");
+                if (seq_item && seq_item->valuedouble > since_seq) {
+                    cJSON_AddItemToArray(arr, cJSON_Duplicate(g_log_ring[idx], 1));
+                }
+            }
+        }
+        cJSON_AddItemToObject(resp, "result", arr);
 
     /* ── unknown ─────────────────────────────────────────────────────────── */
     } else {

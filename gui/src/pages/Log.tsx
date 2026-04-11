@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import type { RuleAction } from '../lib/types';
 import { useLog } from '../hooks/useLog';
 
@@ -39,7 +38,7 @@ export default function Log() {
     if (filterAction !== 'ALL' && entry.action !== filterAction) return false;
     if (search) {
       const s = search.toLowerCase();
-      const line = `${entry.app} ${entry.domain} ${entry.dst_ip} ${entry.proxy} ${entry.action}`.toLowerCase();
+      const line = `${entry.app} ${entry.domain} ${entry.dst_ip} ${entry.action}`.toLowerCase();
       if (!line.includes(s)) return false;
     }
     return true;
@@ -119,12 +118,6 @@ export default function Log() {
           >
             Clear
           </button>
-          <button
-            onClick={() => invoke('test_log_event').catch(console.error)}
-            className="rounded-md border border-[#6366f1] bg-[#6366f1]/10 px-3 py-1.5 text-xs text-[#818cf8] transition-colors hover:bg-[#6366f1]/20"
-          >
-            Test Event
-          </button>
         </div>
       </div>
 
@@ -145,22 +138,23 @@ export default function Log() {
             {filtered.map((entry, idx) => (
               <div
                 key={idx}
-                className={`py-0.5 leading-5 ${ACTION_COLORS[entry.action]}`}
+                className={`py-0.5 leading-5 ${ACTION_COLORS[entry.action as RuleAction] ?? 'text-[#94a3b8]'}`}
               >
                 <span className="text-[#64748b]">[{formatTime(entry.ts)}]</span>{' '}
-                <span className="text-[#e2e8f0]">{entry.app}</span>
-                <span className="text-[#64748b]">:{entry.pid}</span>
-                {' → '}
                 <span className="text-[#e2e8f0]">{entry.domain || entry.dst_ip}</span>
-                {' '}
-                <span className="text-[#64748b]">({entry.dst_port})</span>
+                {' → '}
+                <span className="text-[#64748b]">{entry.dst_ip}:{entry.dst_port}</span>
                 {' via '}
-                <span>{entry.proxy}</span>
+                <span className="text-[#818cf8]">{entry.app || `proxy#${entry.proxy_id}`}</span>
                 {' '}
                 <span className="font-semibold">[{entry.action}]</span>
                 {' '}
+                <span className={entry.success ? 'text-[#4ade80]' : 'text-[#f87171]'}>
+                  {entry.success ? '✓' : '✗'}
+                </span>
+                {' '}
                 <span className="text-[#64748b]">
-                  {'↑'}{formatBytes(entry.bytes_tx)} {'↓'}{formatBytes(entry.bytes_rx)}
+                  {formatBytes(entry.bytes_tx)}/{formatBytes(entry.bytes_rx)}
                 </span>
                 {' '}
                 <span className="text-[#64748b]">{entry.latency_ms}ms</span>

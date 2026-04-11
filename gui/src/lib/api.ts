@@ -159,6 +159,29 @@ export async function dnsLeakStatus(): Promise<{ enabled: boolean; dns_server: s
   return raw?.result ?? raw ?? { enabled: false, dns_server: '1.1.1.1' };
 }
 
+// ── Log polling ─────────────────────────────────────────────────────────────
+
+export interface LogEntryRaw {
+  ts: number;
+  app: string;
+  uid?: number;
+  domain: string;
+  dst_ip: string;
+  dst_port: number;
+  proxy_id: number;
+  action: string;
+  bytes_tx: number;
+  bytes_rx: number;
+  latency_ms: number;
+  success: number;
+  seq: number;
+}
+
+export async function logRecent(sinceSeq: number): Promise<LogEntryRaw[]> {
+  const result = await invoke<any>('log_recent', { sinceSeq });
+  return Array.isArray(result) ? result : [];
+}
+
 // ── System apps ─────────────────────────────────────────────────
 
 export interface SystemApp {

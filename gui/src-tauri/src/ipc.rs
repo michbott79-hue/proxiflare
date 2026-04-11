@@ -111,7 +111,8 @@ impl DaemonClient {
 
     /// Starts a background thread that opens a SECOND, dedicated connection to the daemon,
     /// subscribes to log events, and emits them as Tauri events.
-    /// This avoids any contention with the request/response stream.
+    /// Kept for future use; current log delivery is via log.recent polling.
+    #[allow(dead_code)]
     pub fn start_event_listener(&self, app: AppHandle) {
         // Open a dedicated connection just for push events
         let mut event_stream = match UnixStream::connect(SOCKET_PATH) {

@@ -45,6 +45,7 @@ pub fn proxy_edit(
     username: String,
     password: String,
     check_interval: u32,
+    enabled: bool,
 ) -> Result<Value, String> {
     client.send_request(
         "proxy.edit",
@@ -56,7 +57,8 @@ pub fn proxy_edit(
             "port": port,
             "username": username,
             "password": password,
-            "check_interval": check_interval
+            "check_interval": check_interval,
+            "enabled": enabled
         }),
     )
 }

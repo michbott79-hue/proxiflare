@@ -14,6 +14,7 @@ export default function Chains() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<Record<number, boolean>>({});
   const [testResults, setTestResults] = useState<Record<number, { ok: boolean; latency_ms: number | null; error?: string }>>({});
+  const [openHopDd, setOpenHopDd] = useState<number | null>(null);;
 
   const load = useCallback(async () => {
     try {
@@ -255,15 +256,30 @@ export default function Chains() {
                     {edit.chain.hop_proxy_ids.map((proxyId, idx) => (
                       <div key={idx} className="flex items-center gap-2">
                         <span className="w-6 text-center text-xs text-[#64748b]">{idx + 1}</span>
-                        <select
-                          value={proxyId}
-                          onChange={e => updateHop(idx, parseInt(e.target.value))}
-                          className="flex-1 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
-                        >
-                          {proxies.map(p => (
-                            <option key={p.id} value={p.id}>{p.name} ({p.host}:{p.port})</option>
-                          ))}
-                        </select>
+                        <div className="relative flex-1">
+                          <button
+                            type="button"
+                            onClick={() => setOpenHopDd(openHopDd === idx ? null : idx)}
+                            className="flex w-full items-center justify-between rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-sm text-[#e2e8f0]"
+                          >
+                            <span>{proxies.find(p => p.id === proxyId)?.name ?? `#${proxyId}`} ({proxies.find(p => p.id === proxyId)?.host}:{proxies.find(p => p.id === proxyId)?.port})</span>
+                            <svg className="h-4 w-4 text-[#64748b] shrink-0 ml-2" viewBox="0 0 20 20" fill="currentColor">
+                              <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                            </svg>
+                          </button>
+                          {openHopDd === idx && (
+                            <div className="absolute z-50 mt-1 w-full rounded-md border border-[#2d3348] bg-[#232733] py-1 shadow-xl">
+                              {proxies.map(p => (
+                                <button key={p.id} type="button"
+                                  onClick={() => { updateHop(idx, p.id); setOpenHopDd(null); }}
+                                  className="block w-full px-3 py-2 text-left text-sm text-[#e2e8f0] hover:bg-[#6366f1] hover:text-white transition-colors"
+                                >
+                                  {p.name} ({p.host}:{p.port})
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                         <button
                           onClick={() => moveHop(idx, -1)}
                           disabled={idx === 0}

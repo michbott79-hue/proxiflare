@@ -28,6 +28,7 @@ export default function Log() {
   const [filterApp, setFilterApp] = useState('');
   const [filterDomain, setFilterDomain] = useState('');
   const [filterAction, setFilterAction] = useState<RuleAction | 'ALL'>('ALL');
+  const [showActionDd, setShowActionDd] = useState(false);
   const [search, setSearch] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -67,15 +68,30 @@ export default function Log() {
           placeholder="Domain"
           className="w-36 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
         />
-        <select
-          value={filterAction}
-          onChange={e => setFilterAction(e.target.value as RuleAction | 'ALL')}
-          className="rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] outline-none focus:border-[#6366f1]"
-        >
-          {FILTER_ACTIONS.map(a => (
-            <option key={a} value={a}>{a}</option>
-          ))}
-        </select>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setShowActionDd(p => !p)}
+            className="flex w-32 items-center justify-between rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0]"
+          >
+            <span>{filterAction}</span>
+            <svg className="h-3 w-3 text-[#64748b]" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+            </svg>
+          </button>
+          {showActionDd && (
+            <div className="absolute z-50 mt-1 w-32 rounded-md border border-[#2d3348] bg-[#232733] py-1 shadow-xl">
+              {FILTER_ACTIONS.map(a => (
+                <button key={a} type="button"
+                  onClick={() => { setFilterAction(a); setShowActionDd(false); }}
+                  className="block w-full px-3 py-1.5 text-left text-xs text-[#e2e8f0] hover:bg-[#6366f1] hover:text-white transition-colors"
+                >
+                  {a}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <input
           type="text"
           value={search}

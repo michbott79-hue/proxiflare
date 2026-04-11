@@ -29,6 +29,7 @@ export async function proxyEdit(proxy: Proxy): Promise<Proxy> {
     username: proxy.username || '',
     password: proxy.password || '',
     checkInterval: proxy.check_interval || 60,
+    enabled: proxy.enabled,
   });
 }
 

@@ -1,9 +1,63 @@
+/* ──────────────────────────────────────────────────────────────────────────
+ * ProxiFlare Daemon — main.c
+ * Event loop glue: wires all modules together via epoll.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include "proxiflare.h"
+#include "config.h"
+#include "crypto.h"
+#include "ipc.h"
+#include "dns.h"
+#include "sni.h"
+#include "rules.h"
+#include "proxy_socks.h"
+#include "proxy_http.h"
+#include "proxy_ssh.h"
+#include "chain.h"
+#include "tproxy.h"
+#include "cgroup.h"
+#include "nft.h"
+#include "monitor.h"
+#include "logger.h"
+#include "stats.h"
+#include <cJSON.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
- * String conversion helpers
+ * Global context
+ * ────────────────────────────────────────────────────────────────────────── */
+
+struct pf_ctx {
+    pf_config_t    config;
+    pf_crypto_t    crypto;
+    pf_ipc_t       ipc;
+    pf_dns_t       dns;
+    pf_tproxy_t    tproxy;
+    pf_logger_t    logger;
+    pf_ruleset_t  *ruleset;   /* heap-allocated: ~4.5MB (PF_MAX_RULES * sizeof(pf_rule_t)) */
+    pf_ssh_pool_t  ssh_pool;
+    pf_stats_t     stats;
+    pf_monitor_t   monitor;
+    int            epoll_fd;
+    volatile int   running;   /* volatile int, not bool, for signal safety */
+};
+
+/* Single static instance — avoids putting ~6MB on the stack */
+static struct pf_ctx g_ctx;
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * String conversion helpers (referenced by proxiflare.h, used by all modules)
  * ────────────────────────────────────────────────────────────────────────── */
 
 const char *pf_proxy_type_str(pf_proxy_type_t t)
@@ -48,7 +102,7 @@ pf_proxy_type_t pf_proxy_type_from_str(const char *s)
     if (strcmp(s, "socks5") == 0) return PF_PROXY_SOCKS5;
     if (strcmp(s, "http")   == 0) return PF_PROXY_HTTP;
     if (strcmp(s, "ssh")    == 0) return PF_PROXY_SSH;
-    return PF_PROXY_SOCKS5; /* default */
+    return PF_PROXY_SOCKS5;
 }
 
 pf_action_t pf_action_from_str(const char *s)
@@ -59,15 +113,833 @@ pf_action_t pf_action_from_str(const char *s)
     if (strcmp(s, "chain")  == 0) return PF_ACTION_CHAIN;
     if (strcmp(s, "block")  == 0) return PF_ACTION_BLOCK;
     if (strcmp(s, "reject") == 0) return PF_ACTION_REJECT;
-    return PF_ACTION_DIRECT; /* default */
+    return PF_ACTION_DIRECT;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Entry point
+ * Signal handling
  * ────────────────────────────────────────────────────────────────────────── */
 
-int main(void)
+static void sig_handler(int signum)
 {
-    printf("ProxiFlare daemon v%s\n", PF_VERSION);
+    if (signum == SIGTERM || signum == SIGINT) {
+        g_ctx.running = 0;
+    }
+    /* SIGHUP → reload is handled in the main loop via a flag */
+}
+
+static volatile int g_reload = 0;
+
+static void sig_hup(int signum)
+{
+    (void)signum;
+    g_reload = 1;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Process monitor callback
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static void on_process_event(pid_t pid, const char *exe_path, bool is_exec, void *userdata)
+{
+    pf_ctx_t *ctx = (pf_ctx_t *)userdata;
+
+    if (is_exec) {
+        if (!ctx->ruleset) return;
+        const pf_rule_t *rule = pf_rules_match(ctx->ruleset, exe_path, NULL, NULL, 0);
+        if (rule && rule->action != PF_ACTION_DIRECT) {
+            pf_cgroup_assign_pid((int)rule->id, pid);
+        }
+    } else {
+        pf_cgroup_remove_pid(pid);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Helpers: proxy / rule / chain JSON serialization
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static cJSON *proxy_to_json(const pf_proxy_t *p)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddNumberToObject(obj, "id",         (double)p->id);
+    cJSON_AddStringToObject(obj, "name",       p->name);
+    cJSON_AddStringToObject(obj, "type",       pf_proxy_type_str(p->type));
+    cJSON_AddStringToObject(obj, "host",       p->host);
+    cJSON_AddNumberToObject(obj, "port",       p->port);
+    cJSON_AddStringToObject(obj, "username",   p->username);
+    cJSON_AddStringToObject(obj, "health",     pf_health_str(p->health));
+    cJSON_AddNumberToObject(obj, "latency_ms", (double)p->latency_ms);
+    cJSON_AddBoolToObject  (obj, "enabled",    p->enabled);
+    return obj;
+}
+
+static cJSON *rule_to_json(const pf_rule_t *r)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddNumberToObject(obj, "id",       (double)r->id);
+    cJSON_AddStringToObject(obj, "name",     r->name);
+    cJSON_AddNumberToObject(obj, "priority", r->priority);
+    cJSON_AddStringToObject(obj, "app_path", r->app_path);
+    cJSON_AddStringToObject(obj, "domain",   r->domain);
+    cJSON_AddStringToObject(obj, "ip_cidr",  r->ip_cidr);
+    cJSON_AddNumberToObject(obj, "dst_port", r->dst_port);
+    cJSON_AddStringToObject(obj, "action",   pf_action_str(r->action));
+    cJSON_AddNumberToObject(obj, "proxy_id", (double)r->proxy_id);
+    cJSON_AddNumberToObject(obj, "chain_id", (double)r->chain_id);
+    cJSON_AddBoolToObject  (obj, "enabled",  r->enabled);
+    return obj;
+}
+
+static cJSON *chain_to_json(const pf_chain_t *c)
+{
+    cJSON *obj  = cJSON_CreateObject();
+    cJSON *hops = cJSON_CreateArray();
+    cJSON_AddNumberToObject(obj, "id",      (double)c->id);
+    cJSON_AddStringToObject(obj, "name",    c->name);
+    cJSON_AddBoolToObject  (obj, "enabled", c->enabled);
+    for (int i = 0; i < c->hop_count; i++)
+        cJSON_AddItemToArray(hops, cJSON_CreateNumber((double)c->hops[i]));
+    cJSON_AddItemToObject(obj, "hops", hops);
+    return obj;
+}
+
+/* Convenience: parse a proxy from cJSON params */
+static void proxy_from_json(pf_proxy_t *p, cJSON *params)
+{
+    cJSON *v;
+    memset(p, 0, sizeof(*p));
+    if ((v = cJSON_GetObjectItem(params, "id")))
+        p->id = (uint32_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "name")))
+        snprintf(p->name, sizeof(p->name), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "type")))
+        p->type = pf_proxy_type_from_str(v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "host")))
+        snprintf(p->host, sizeof(p->host), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "port")))
+        p->port = (uint16_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "username")))
+        snprintf(p->username, sizeof(p->username), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "password")))
+        snprintf(p->password, sizeof(p->password), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "ssh_key_path")))
+        snprintf(p->ssh_key_path, sizeof(p->ssh_key_path), "%s", v->valuestring);
+    p->enabled = 1;
+    if ((v = cJSON_GetObjectItem(params, "enabled")))
+        p->enabled = cJSON_IsTrue(v) ? 1 : 0;
+}
+
+static void rule_from_json(pf_rule_t *r, cJSON *params)
+{
+    cJSON *v;
+    memset(r, 0, sizeof(*r));
+    if ((v = cJSON_GetObjectItem(params, "id")))
+        r->id = (uint32_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "name")))
+        snprintf(r->name, sizeof(r->name), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "priority")))
+        r->priority = (int)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "app_path")))
+        snprintf(r->app_path, sizeof(r->app_path), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "domain")))
+        snprintf(r->domain, sizeof(r->domain), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "ip_cidr")))
+        snprintf(r->ip_cidr, sizeof(r->ip_cidr), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "dst_port")))
+        r->dst_port = (uint16_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "action")))
+        r->action = pf_action_from_str(v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "proxy_id")))
+        r->proxy_id = (uint32_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "chain_id")))
+        r->chain_id = (uint32_t)v->valuedouble;
+    r->enabled = 1;
+    if ((v = cJSON_GetObjectItem(params, "enabled")))
+        r->enabled = cJSON_IsTrue(v) ? 1 : 0;
+}
+
+static void chain_from_json(pf_chain_t *c, cJSON *params)
+{
+    cJSON *v;
+    memset(c, 0, sizeof(*c));
+    if ((v = cJSON_GetObjectItem(params, "id")))
+        c->id = (uint32_t)v->valuedouble;
+    if ((v = cJSON_GetObjectItem(params, "name")))
+        snprintf(c->name, sizeof(c->name), "%s", v->valuestring);
+    c->enabled = 1;
+    if ((v = cJSON_GetObjectItem(params, "enabled")))
+        c->enabled = cJSON_IsTrue(v) ? 1 : 0;
+    cJSON *hops = cJSON_GetObjectItem(params, "hops");
+    if (hops && cJSON_IsArray(hops)) {
+        int n = cJSON_GetArraySize(hops);
+        if (n > PF_MAX_HOPS) n = PF_MAX_HOPS;
+        c->hop_count = n;
+        for (int i = 0; i < n; i++)
+            c->hops[i] = (uint32_t)cJSON_GetArrayItem(hops, i)->valuedouble;
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * IPC request handler
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
+                                 cJSON *params, pf_ipc_client_t *client)
+{
+    (void)client; /* used selectively */
+
+    cJSON *resp = cJSON_CreateObject();
+
+    /* ── proxy.list ──────────────────────────────────────────────────────── */
+    if (strcmp(method, "proxy.list") == 0) {
+        pf_proxy_t buf[PF_MAX_PROXIES];
+        int count = 0;
+        if (pf_config_proxy_list(&ctx->config, buf, PF_MAX_PROXIES, &count) == PF_OK) {
+            cJSON *arr = cJSON_CreateArray();
+            for (int i = 0; i < count; i++)
+                cJSON_AddItemToArray(arr, proxy_to_json(&buf[i]));
+            cJSON_AddItemToObject(resp, "result", arr);
+        } else {
+            cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── proxy.add ───────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "proxy.add") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_proxy_t p;
+            proxy_from_json(&p, params);
+            if (pf_config_proxy_add(&ctx->config, &p) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── proxy.edit ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "proxy.edit") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_proxy_t p;
+            proxy_from_json(&p, params);
+            if (pf_config_proxy_update(&ctx->config, &p) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── proxy.delete ────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "proxy.delete") == 0) {
+        cJSON *id_v = params ? cJSON_GetObjectItem(params, "id") : NULL;
+        if (!id_v) {
+            cJSON_AddStringToObject(resp, "error", "missing id");
+        } else {
+            int id = (int)id_v->valuedouble;
+            if (pf_config_proxy_delete(&ctx->config, id) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── proxy.test ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "proxy.test") == 0) {
+        cJSON *id_v = params ? cJSON_GetObjectItem(params, "id") : NULL;
+        if (!id_v) {
+            cJSON_AddStringToObject(resp, "error", "missing id");
+        } else {
+            int id = (int)id_v->valuedouble;
+            pf_proxy_t p;
+            if (pf_config_proxy_get(&ctx->config, id, &p) != PF_OK) {
+                cJSON_AddStringToObject(resp, "error", "proxy not found");
+            } else {
+                int latency = -1;
+                if      (p.type == PF_PROXY_SOCKS4 || p.type == PF_PROXY_SOCKS5)
+                    latency = pf_socks_test(&p);
+                else if (p.type == PF_PROXY_HTTP)
+                    latency = pf_http_test(&p);
+                else if (p.type == PF_PROXY_SSH)
+                    latency = pf_ssh_test(&ctx->ssh_pool, &p);
+
+                cJSON *r = cJSON_CreateObject();
+                cJSON_AddNumberToObject(r, "latency_ms", latency);
+                cJSON_AddStringToObject(r, "health",
+                    latency >= 0 ? (latency > 1000 ? "slow" : "online") : "offline");
+                cJSON_AddItemToObject(resp, "result", r);
+
+                /* update health in DB */
+                pf_health_t h = (latency < 0) ? PF_HEALTH_OFFLINE
+                              : (latency > 1000) ? PF_HEALTH_SLOW : PF_HEALTH_ONLINE;
+                pf_config_proxy_update_health(&ctx->config, id, h, latency);
+            }
+        }
+
+    /* ── rule.list ───────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "rule.list") == 0) {
+        pf_rule_t buf[PF_MAX_RULES];
+        int count = 0;
+        if (pf_config_rule_list(&ctx->config, buf, PF_MAX_RULES, &count) == PF_OK) {
+            cJSON *arr = cJSON_CreateArray();
+            for (int i = 0; i < count; i++)
+                cJSON_AddItemToArray(arr, rule_to_json(&buf[i]));
+            cJSON_AddItemToObject(resp, "result", arr);
+        } else {
+            cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── rule.add ────────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "rule.add") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_rule_t r;
+            rule_from_json(&r, params);
+            if (pf_config_rule_add(&ctx->config, &r) == PF_OK) {
+                /* reload ruleset */
+                pf_rules_load(ctx->ruleset, &ctx->config);
+                cJSON_AddStringToObject(resp, "result", "ok");
+            } else {
+                cJSON_AddStringToObject(resp, "error", "db error");
+            }
+        }
+
+    /* ── rule.edit ───────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "rule.edit") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_rule_t r;
+            rule_from_json(&r, params);
+            if (pf_config_rule_update(&ctx->config, &r) == PF_OK) {
+                pf_rules_load(ctx->ruleset, &ctx->config);
+                cJSON_AddStringToObject(resp, "result", "ok");
+            } else {
+                cJSON_AddStringToObject(resp, "error", "db error");
+            }
+        }
+
+    /* ── rule.delete ─────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "rule.delete") == 0) {
+        cJSON *id_v = params ? cJSON_GetObjectItem(params, "id") : NULL;
+        if (!id_v) {
+            cJSON_AddStringToObject(resp, "error", "missing id");
+        } else {
+            int id = (int)id_v->valuedouble;
+            if (pf_config_rule_delete(&ctx->config, id) == PF_OK) {
+                pf_rules_load(ctx->ruleset, &ctx->config);
+                cJSON_AddStringToObject(resp, "result", "ok");
+            } else {
+                cJSON_AddStringToObject(resp, "error", "db error");
+            }
+        }
+
+    /* ── chain.list ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "chain.list") == 0) {
+        pf_chain_t buf[PF_MAX_CHAINS];
+        int count = 0;
+        if (pf_config_chain_list(&ctx->config, buf, PF_MAX_CHAINS, &count) == PF_OK) {
+            cJSON *arr = cJSON_CreateArray();
+            for (int i = 0; i < count; i++)
+                cJSON_AddItemToArray(arr, chain_to_json(&buf[i]));
+            cJSON_AddItemToObject(resp, "result", arr);
+        } else {
+            cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── chain.add ───────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "chain.add") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_chain_t c;
+            chain_from_json(&c, params);
+            if (pf_config_chain_add(&ctx->config, &c) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── chain.edit ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "chain.edit") == 0) {
+        if (!params) {
+            cJSON_AddStringToObject(resp, "error", "missing params");
+        } else {
+            pf_chain_t c;
+            chain_from_json(&c, params);
+            if (pf_config_chain_update(&ctx->config, &c) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── chain.delete ────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "chain.delete") == 0) {
+        cJSON *id_v = params ? cJSON_GetObjectItem(params, "id") : NULL;
+        if (!id_v) {
+            cJSON_AddStringToObject(resp, "error", "missing id");
+        } else {
+            int id = (int)id_v->valuedouble;
+            if (pf_config_chain_delete(&ctx->config, id) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── config.get ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "config.get") == 0) {
+        cJSON *key_v = params ? cJSON_GetObjectItem(params, "key") : NULL;
+        if (!key_v || !key_v->valuestring) {
+            cJSON_AddStringToObject(resp, "error", "missing key");
+        } else {
+            char value[PF_BUF_SIZE] = {0};
+            if (pf_config_get(&ctx->config, key_v->valuestring, value, (int)sizeof(value)) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", value);
+            else
+                cJSON_AddStringToObject(resp, "error", "key not found");
+        }
+
+    /* ── config.set ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "config.set") == 0) {
+        cJSON *key_v = params ? cJSON_GetObjectItem(params, "key")   : NULL;
+        cJSON *val_v = params ? cJSON_GetObjectItem(params, "value") : NULL;
+        if (!key_v || !key_v->valuestring || !val_v || !val_v->valuestring) {
+            cJSON_AddStringToObject(resp, "error", "missing key or value");
+        } else {
+            const char *key = key_v->valuestring;
+            const char *val = val_v->valuestring;
+
+            /* special: boot_enabled → systemctl enable/disable */
+            if (strcmp(key, "boot_enabled") == 0) {
+                const char *cmd = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0)
+                    ? "systemctl enable proxiflare.service >/dev/null 2>&1"
+                    : "systemctl disable proxiflare.service >/dev/null 2>&1";
+                system(cmd);
+            }
+
+            if (pf_config_set(&ctx->config, key, val) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "db error");
+        }
+
+    /* ── credentials.unlock ──────────────────────────────────────────────── */
+    } else if (strcmp(method, "credentials.unlock") == 0) {
+        cJSON *pw_v = params ? cJSON_GetObjectItem(params, "password") : NULL;
+        if (!pw_v || !pw_v->valuestring) {
+            cJSON_AddStringToObject(resp, "error", "missing password");
+        } else {
+            /* load salt from config */
+            char salt_hex[64] = {0};
+            uint8_t salt[PF_SALT_LEN] = {0};
+            if (pf_config_get(&ctx->config, "crypto_salt", salt_hex, (int)sizeof(salt_hex)) == PF_OK) {
+                /* salt stored as hex — decode */
+                for (int i = 0; i < PF_SALT_LEN && (size_t)(i * 2 + 1) < strlen(salt_hex); i++) {
+                    unsigned int byte;
+                    sscanf(salt_hex + i * 2, "%02x", &byte);
+                    salt[i] = (uint8_t)byte;
+                }
+            } else {
+                /* no salt yet — generate and persist */
+                pf_crypto_random_salt(salt, PF_SALT_LEN);
+                char new_hex[PF_SALT_LEN * 2 + 1];
+                for (int i = 0; i < PF_SALT_LEN; i++)
+                    snprintf(new_hex + i * 2, 3, "%02x", salt[i]);
+                pf_config_set(&ctx->config, "crypto_salt", new_hex);
+            }
+
+            if (pf_crypto_unlock(&ctx->crypto, pw_v->valuestring, salt) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "unlock failed");
+        }
+
+    /* ── credentials.lock ────────────────────────────────────────────────── */
+    } else if (strcmp(method, "credentials.lock") == 0) {
+        pf_crypto_lock(&ctx->crypto);
+        cJSON_AddStringToObject(resp, "result", "ok");
+
+    /* ── system.status ───────────────────────────────────────────────────── */
+    } else if (strcmp(method, "system.status") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject  (r, "running",    ctx->running ? true : false);
+        cJSON_AddStringToObject(r, "version",    PF_VERSION);
+        cJSON_AddNumberToObject(r, "connections", ctx->tproxy.conn_count);
+        cJSON_AddBoolToObject  (r, "crypto_unlocked", ctx->crypto.unlocked);
+        cJSON_AddBoolToObject  (r, "dns_active",  ctx->dns.fd > 0);
+        cJSON_AddBoolToObject  (r, "tproxy_active", ctx->tproxy.listen_fd > 0);
+        cJSON_AddItemToObject  (resp, "result", r);
+
+    /* ── system.version ──────────────────────────────────────────────────── */
+    } else if (strcmp(method, "system.version") == 0) {
+        cJSON_AddStringToObject(resp, "result", PF_VERSION);
+
+    /* ── unknown ─────────────────────────────────────────────────────────── */
+    } else {
+        cJSON_AddStringToObject(resp, "error", "unknown method");
+    }
+
+    return resp;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * epoll helpers
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static int epoll_add(int epfd, int fd, uint32_t events)
+{
+    if (fd < 0) return -1;
+    struct epoll_event ev;
+    ev.events  = events;
+    ev.data.fd = fd;
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+static int epoll_del(int epfd, int fd)
+{
+    if (fd < 0) return -1;
+    return epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * PID file
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static int write_pid_file(const char *path)
+{
+    /* ensure directory exists */
+    char dir[PF_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "%d\n", getpid());
+    fclose(f);
+    return 0;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * main()
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define MAX_EVENTS 64
+
+int main(int argc, char *argv[])
+{
+    int foreground = 0;
+    const char *config_dir = PF_CONFIG_DIR;
+    char db_path[PF_PATH_MAX];
+    char sock_path[PF_PATH_MAX];
+    char log_path[PF_PATH_MAX];
+
+    /* ── 1. Parse args ─────────────────────────────────────────────────── */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--foreground") == 0) {
+            foreground = 1;
+        } else if (strcmp(argv[i], "--config-dir") == 0 && i + 1 < argc) {
+            config_dir = argv[++i];
+        } else {
+            fprintf(stderr, "Usage: %s [--foreground] [--config-dir PATH]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    /* Use compiled-in default paths (config_dir reserved for future override) */
+    snprintf(db_path,   sizeof(db_path),   "%s", PF_DB_PATH);
+    snprintf(sock_path, sizeof(sock_path), "%s", PF_SOCKET_PATH);
+    snprintf(log_path,  sizeof(log_path),  "%s", PF_LOG_PATH);
+    (void)config_dir; /* reserved for future config file override */
+
+    /* ── 2. Root check ─────────────────────────────────────────────────── */
+    if (getuid() != 0) {
+        fprintf(stderr, "[proxiflare] WARNING: not running as root — "
+                        "kernel features (NFQUEUE, tproxy, cgroups) will be disabled\n");
+    }
+
+    /* ── 3. Daemonize (unless --foreground) ───────────────────────────── */
+    if (!foreground) {
+        /* Don't daemonize when run under systemd (it manages the process).
+         * For standalone use: fork + setsid + close stdio.
+         * We leave it simple: daemonize only when explicitly not foreground.
+         * Currently a no-op placeholder — systemd unit uses --foreground. */
+        (void)0;
+    }
+
+    /* ── 4. PID file ───────────────────────────────────────────────────── */
+    if (write_pid_file(PF_PID_FILE) < 0) {
+        fprintf(stderr, "[proxiflare] WARNING: cannot write PID file %s: %s\n",
+                PF_PID_FILE, strerror(errno));
+    }
+
+    /* ── 5. Signal handlers ────────────────────────────────────────────── */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sig_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+        sa.sa_handler = sig_hup;
+        sigaction(SIGHUP,  &sa, NULL);
+        /* ignore SIGPIPE — write() on closed sockets returns EPIPE */
+        signal(SIGPIPE, SIG_IGN);
+    }
+
+    /* ── 6. Init context ───────────────────────────────────────────────── */
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    pf_ctx_t *ctx = &g_ctx;
+    ctx->running = 1;
+
+    /* 5a. Config (SQLite) */
+    if (pf_config_init(&ctx->config, db_path) != PF_OK) {
+        fprintf(stderr, "[proxiflare] FATAL: config_init failed (%s)\n", db_path);
+        return 1;
+    }
+    pf_log_info("Config DB opened: %s", db_path);
+
+    /* 5b. Crypto */
+    if (pf_crypto_init(&ctx->crypto) != PF_OK) {
+        fprintf(stderr, "[proxiflare] FATAL: crypto_init failed\n");
+        pf_config_close(&ctx->config);
+        return 1;
+    }
+    pf_log_info("Crypto subsystem ready (locked)");
+
+    /* 5c. Logger */
+    if (pf_logger_init(&ctx->logger, log_path) != PF_OK) {
+        fprintf(stderr, "[proxiflare] WARNING: logger_init failed — disk logging disabled\n");
+    } else {
+        pf_log_info("Logger ready: %s", log_path);
+    }
+
+    /* 5d. Ruleset (heap) */
+    ctx->ruleset = calloc(1, sizeof(pf_ruleset_t));
+    if (!ctx->ruleset) {
+        fprintf(stderr, "[proxiflare] FATAL: cannot allocate ruleset (%zu bytes)\n",
+                sizeof(pf_ruleset_t));
+        pf_logger_close(&ctx->logger);
+        pf_config_close(&ctx->config);
+        return 1;
+    }
+    if (pf_rules_load(ctx->ruleset, &ctx->config) != PF_OK) {
+        pf_log_warn("rules_load failed — starting with empty ruleset");
+    } else {
+        pf_log_info("Rules loaded: %d rules", ctx->ruleset->count);
+    }
+
+    /* 5e. IPC server (must always succeed) */
+    if (pf_ipc_init(&ctx->ipc, sock_path, ctx, pf_handle_request) < 0) {
+        fprintf(stderr, "[proxiflare] FATAL: ipc_init failed (%s)\n", sock_path);
+        free(ctx->ruleset);
+        pf_logger_close(&ctx->logger);
+        pf_config_close(&ctx->config);
+        return 1;
+    }
+    pf_log_info("IPC listening on %s", sock_path);
+
+    /* 5f. Stats */
+    if (pf_stats_init(&ctx->stats) != PF_OK)
+        pf_log_warn("stats_init failed — stats disabled");
+
+    /* 5g. SSH pool */
+    if (pf_ssh_pool_init(&ctx->ssh_pool) != PF_OK)
+        pf_log_warn("ssh_pool_init failed — SSH proxies will not work");
+
+    /* 5h. DNS (NFQUEUE) — optional, requires root + kernel module */
+    if (pf_dns_init(&ctx->dns, ctx->ruleset) != PF_OK) {
+        pf_log_warn("dns_init failed — DNS-based routing disabled "
+                    "(requires root and nf_queue kernel module)");
+        ctx->dns.fd = -1;
+    } else {
+        pf_log_info("DNS NFQUEUE active (fd=%d)", ctx->dns.fd);
+    }
+
+    /* 5i. nftables — optional, requires root */
+    if (pf_nft_init() != PF_OK) {
+        pf_log_warn("nft_init failed — nftables rules not installed "
+                    "(requires root and nftables)");
+    } else {
+        if (pf_nft_setup_dns_redirect() != PF_OK)
+            pf_log_warn("nft_setup_dns_redirect failed");
+        if (pf_nft_setup_tproxy(PF_TPROXY_PORT) != PF_OK)
+            pf_log_warn("nft_setup_tproxy failed");
+        pf_log_info("nftables rules installed");
+    }
+
+    /* 5j. cgroups — optional, requires root */
+    if (pf_cgroup_init() != PF_OK) {
+        pf_log_warn("cgroup_init failed — per-app routing disabled "
+                    "(requires root and cgroup v2)");
+    } else {
+        pf_log_info("cgroup hierarchy ready at %s", PF_CGROUP_BASE);
+    }
+
+    /* 5k. TPROXY — optional, requires root + nft setup */
+    if (pf_tproxy_init(&ctx->tproxy, PF_TPROXY_PORT) != PF_OK) {
+        pf_log_warn("tproxy_init failed — transparent proxy disabled "
+                    "(requires root and IP_TRANSPARENT)");
+        ctx->tproxy.listen_fd = -1;
+    } else {
+        pf_log_info("TPROXY listening on port %d", PF_TPROXY_PORT);
+    }
+
+    /* 5l. Process monitor (netlink) — optional, requires root */
+    if (pf_monitor_init(&ctx->monitor, on_process_event, ctx) != PF_OK) {
+        pf_log_warn("monitor_init failed — process exec monitoring disabled "
+                    "(requires root and CN_PROC netlink)");
+        ctx->monitor.nl_fd = -1;
+    } else {
+        pf_log_info("Process monitor active (fd=%d)", ctx->monitor.nl_fd);
+    }
+
+    /* ── 7. Create epoll, register fds ────────────────────────────────── */
+    ctx->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (ctx->epoll_fd < 0) {
+        pf_log_error("epoll_create1 failed: %s", strerror(errno));
+        goto shutdown;
+    }
+
+    /* IPC listen fd — always present */
+    if (epoll_add(ctx->epoll_fd, ctx->ipc.listen_fd, EPOLLIN) < 0)
+        pf_log_error("epoll_add ipc.listen_fd failed: %s", strerror(errno));
+
+    /* DNS fd */
+    if (ctx->dns.fd > 0)
+        epoll_add(ctx->epoll_fd, ctx->dns.fd, EPOLLIN);
+
+    /* TPROXY listen fd */
+    if (ctx->tproxy.listen_fd > 0)
+        epoll_add(ctx->epoll_fd, ctx->tproxy.listen_fd, EPOLLIN);
+
+    /* Monitor netlink fd */
+    if (ctx->monitor.nl_fd > 0)
+        epoll_add(ctx->epoll_fd, ctx->monitor.nl_fd, EPOLLIN);
+
+    pf_log_info("ProxiFlare daemon v%s started (pid=%d)", PF_VERSION, getpid());
+
+    /* ── 8. Main event loop ────────────────────────────────────────────── */
+    {
+        struct epoll_event events[MAX_EVENTS];
+
+        while (ctx->running) {
+
+            /* Check for config reload (SIGHUP) */
+            if (g_reload) {
+                g_reload = 0;
+                pf_log_info("SIGHUP received — reloading config and ruleset");
+                pf_rules_load(ctx->ruleset, &ctx->config);
+            }
+
+            int nev = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 1000 /* ms */);
+            if (nev < 0) {
+                if (errno == EINTR) continue;
+                pf_log_error("epoll_wait: %s", strerror(errno));
+                break;
+            }
+
+            for (int i = 0; i < nev; i++) {
+                int fd = events[i].data.fd;
+
+                /* ── IPC: new client connection ────────────────────────── */
+                if (fd == ctx->ipc.listen_fd) {
+                    int idx = pf_ipc_accept(&ctx->ipc);
+                    if (idx >= 0) {
+                        int cfd = ctx->ipc.clients[idx].fd;
+                        if (epoll_add(ctx->epoll_fd, cfd, EPOLLIN) < 0)
+                            pf_log_warn("epoll_add ipc client fd failed");
+                    }
+                    continue;
+                }
+
+                /* ── DNS NFQUEUE ───────────────────────────────────────── */
+                if (ctx->dns.fd > 0 && fd == ctx->dns.fd) {
+                    pf_dns_process(&ctx->dns);
+                    continue;
+                }
+
+                /* ── TPROXY: new connection ────────────────────────────── */
+                if (ctx->tproxy.listen_fd > 0 && fd == ctx->tproxy.listen_fd) {
+                    pf_tproxy_accept(&ctx->tproxy);
+                    continue;
+                }
+
+                /* ── Monitor netlink ───────────────────────────────────── */
+                if (ctx->monitor.nl_fd > 0 && fd == ctx->monitor.nl_fd) {
+                    pf_monitor_process(&ctx->monitor);
+                    continue;
+                }
+
+                /* ── IPC: data from existing client ────────────────────── */
+                {
+                    int found = 0;
+                    for (int j = 0; j < ctx->ipc.client_count; j++) {
+                        if (ctx->ipc.clients[j].fd == fd) {
+                            found = 1;
+                            int rc = pf_ipc_process(&ctx->ipc, j);
+                            if (rc < 0) {
+                                /* client disconnected or error */
+                                epoll_del(ctx->epoll_fd, fd);
+                            }
+                            break;
+                        }
+                    }
+
+                    /* ── TPROXY: relay existing connection ─────────────── */
+                    if (!found) {
+                        for (int j = 0; j < PF_MAX_CONNECTIONS; j++) {
+                            if (ctx->tproxy.conns[j].active &&
+                                (ctx->tproxy.conns[j].client_fd == fd ||
+                                 ctx->tproxy.conns[j].proxy_fd  == fd))
+                            {
+                                int rc = pf_tproxy_relay(&ctx->tproxy, j);
+                                if (rc < 0) {
+                                    epoll_del(ctx->epoll_fd, ctx->tproxy.conns[j].client_fd);
+                                    epoll_del(ctx->epoll_fd, ctx->tproxy.conns[j].proxy_fd);
+                                    pf_tproxy_close_conn(&ctx->tproxy, j);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } /* for each event */
+        } /* while running */
+    }
+
+shutdown:
+    pf_log_info("Shutting down...");
+
+    /* ── 9. Cleanup in reverse order ───────────────────────────────────── */
+    if (ctx->epoll_fd >= 0)
+        close(ctx->epoll_fd);
+
+    pf_nft_cleanup();
+    pf_cgroup_cleanup();
+
+    if (ctx->monitor.nl_fd >= 0)
+        pf_monitor_close(&ctx->monitor);
+
+    if (ctx->tproxy.listen_fd >= 0)
+        pf_tproxy_close(&ctx->tproxy);
+
+    if (ctx->dns.fd >= 0)
+        pf_dns_close(&ctx->dns);
+
+    pf_ssh_pool_close(&ctx->ssh_pool);
+    pf_ipc_close(&ctx->ipc);
+    pf_logger_close(&ctx->logger);
+    pf_config_close(&ctx->config);
+
+    free(ctx->ruleset);
+    ctx->ruleset = NULL;
+
+    unlink(PF_PID_FILE);
+
+    pf_log_info("ProxiFlare daemon stopped");
     return 0;
 }

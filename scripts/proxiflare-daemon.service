@@ -1,0 +1,14 @@
+[Unit]
+Description=ProxiFlare Proxy Router Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/proxiflare-daemon --foreground
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

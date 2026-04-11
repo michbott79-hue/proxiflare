@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4f46e5"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="flare" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f59e0b"/>
+      <stop offset="50%" style="stop-color:#ef4444"/>
+      <stop offset="100%" style="stop-color:#ec4899"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" style="stop-color:#e2e8f0;stop-opacity:0.95"/>
+      <stop offset="100%" style="stop-color:#94a3b8;stop-opacity:0.85"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <!-- Outer ring -->
+  <circle cx="256" cy="256" r="220" fill="none" stroke="#e2e8f0" stroke-width="2" stroke-opacity="0.2"/>
+
+  <!-- Flare rays (proxy routes) -->
+  <g filter="url(#glow)" opacity="0.9">
+    <!-- Top ray -->
+    <path d="M256 80 L270 160 L256 150 L242 160 Z" fill="url(#flare)"/>
+    <!-- Top-right ray -->
+    <path d="M380 120 L320 185 L310 172 L325 165 Z" fill="url(#flare)"/>
+    <!-- Right ray -->
+    <path d="M432 256 L352 242 L362 256 L352 270 Z" fill="url(#flare)"/>
+    <!-- Bottom-right ray -->
+    <path d="M380 392 L320 327 L325 347 L310 340 Z" fill="url(#flare)"/>
+    <!-- Bottom ray -->
+    <path d="M256 432 L242 352 L256 362 L270 352 Z" fill="url(#flare)"/>
+    <!-- Bottom-left ray -->
+    <path d="M132 392 L192 327 L187 347 L202 340 Z" fill="url(#flare)"/>
+    <!-- Left ray -->
+    <path d="M80 256 L160 270 L150 256 L160 242 Z" fill="url(#flare)"/>
+    <!-- Top-left ray -->
+    <path d="M132 120 L192 185 L187 172 L202 165 Z" fill="url(#flare)"/>
+  </g>
+
+  <!-- Central shield -->
+  <path d="M256 140 L340 185 L340 300 C340 355 256 400 256 400 C256 400 172 355 172 300 L172 185 Z"
+        fill="url(#shield)" fill-opacity="0.15" stroke="url(#shield)" stroke-width="3" filter="url(#shadow)"/>
+
+  <!-- Network nodes on shield -->
+  <!-- Central node -->
+  <circle cx="256" cy="250" r="18" fill="url(#flare)" filter="url(#glow)"/>
+  <circle cx="256" cy="250" r="8" fill="#fff"/>
+
+  <!-- Connecting lines -->
+  <line x1="256" y1="250" x2="210" y2="200" stroke="#e2e8f0" stroke-width="2.5" stroke-opacity="0.7"/>
+  <line x1="256" y1="250" x2="302" y2="200" stroke="#e2e8f0" stroke-width="2.5" stroke-opacity="0.7"/>
+  <line x1="256" y1="250" x2="210" y2="310" stroke="#e2e8f0" stroke-width="2.5" stroke-opacity="0.7"/>
+  <line x1="256" y1="250" x2="302" y2="310" stroke="#e2e8f0" stroke-width="2.5" stroke-opacity="0.7"/>
+  <line x1="256" y1="250" x2="256" y2="340" stroke="#e2e8f0" stroke-width="2.5" stroke-opacity="0.7"/>
+
+  <!-- Outer nodes -->
+  <circle cx="210" cy="200" r="10" fill="#6366f1" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="302" cy="200" r="10" fill="#6366f1" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="210" cy="310" r="10" fill="#22c55e" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="302" cy="310" r="10" fill="#22c55e" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="256" cy="340" r="10" fill="#f59e0b" stroke="#e2e8f0" stroke-width="2"/>
+
+  <!-- Arrow indicators on rays (routing direction) -->
+  <circle cx="256" cy="105" r="5" fill="#f59e0b" opacity="0.8"/>
+  <circle cx="365" cy="140" r="5" fill="#ef4444" opacity="0.8"/>
+  <circle cx="410" cy="256" r="5" fill="#f59e0b" opacity="0.8"/>
+  <circle cx="365" cy="372" r="5" fill="#ec4899" opacity="0.8"/>
+  <circle cx="256" cy="410" r="5" fill="#f59e0b" opacity="0.8"/>
+  <circle cx="147" cy="372" r="5" fill="#ec4899" opacity="0.8"/>
+  <circle cx="102" cy="256" r="5" fill="#f59e0b" opacity="0.8"/>
+  <circle cx="147" cy="140" r="5" fill="#ef4444" opacity="0.8"/>
+</svg>

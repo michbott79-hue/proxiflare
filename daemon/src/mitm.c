@@ -158,11 +158,11 @@ static int generate_domain_cert(pf_mitm_t *m, const char *domain,
     X509     *cert = NULL;
     int       rc   = PF_ERR;
 
-    /* Generate RSA 2048 key for this domain */
-    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    /* Generate EC P-256 key for this domain (10x faster than RSA 2048) */
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
     if (!kctx) goto fail;
     if (EVP_PKEY_keygen_init(kctx) <= 0) goto fail;
-    if (EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) <= 0) goto fail;
+    if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx, NID_X9_62_prime256v1) <= 0) goto fail;
     if (EVP_PKEY_keygen(kctx, &pkey) <= 0) goto fail;
     EVP_PKEY_CTX_free(kctx);
     kctx = NULL;
@@ -229,6 +229,28 @@ fail:
  * pf_mitm_init
  * ────────────────────────────────────────────────────────────────────────── */
 
+/* ALPN select callback — always select http/1.1, reject h2.
+ * This forces browsers to fall back to HTTP/1.1 which our parser understands. */
+static int mitm_alpn_select_cb(SSL *ssl, const unsigned char **out,
+                                unsigned char *outlen,
+                                const unsigned char *in, unsigned int inlen,
+                                void *arg)
+{
+    (void)ssl; (void)arg;
+    static const unsigned char http11[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+
+    /* Search client's ALPN list for http/1.1 */
+    if (SSL_select_next_proto((unsigned char **)out, outlen,
+                               http11, sizeof(http11), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+
+    /* If client doesn't offer http/1.1, select it anyway (force downgrade) */
+    *out = http11 + 1;
+    *outlen = 8;
+    return SSL_TLSEXT_ERR_OK;
+}
+
 int pf_mitm_init(pf_mitm_t *m)
 {
     if (!m) return PF_ERR;
@@ -273,6 +295,11 @@ int pf_mitm_init(pf_mitm_t *m)
         return PF_ERR;
     }
     SSL_CTX_set_min_proto_version(m->server_ctx, TLS1_2_VERSION);
+
+    /* Force HTTP/1.1 only — server ALPN select callback.
+     * Without this, browsers negotiate h2 (binary framing)
+     * which our HTTP/1.1 parser cannot decode. */
+    SSL_CTX_set_alpn_select_cb(m->server_ctx, mitm_alpn_select_cb, NULL);
 
     /* Client SSL context (for connecting to real servers) */
     m->client_ctx = SSL_CTX_new(TLS_client_method());

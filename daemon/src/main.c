@@ -86,12 +86,12 @@ const char *pf_health_str(pf_health_t h)
 const char *pf_action_str(pf_action_t a)
 {
     switch (a) {
-        case PF_ACTION_DIRECT: return "direct";
-        case PF_ACTION_PROXY:  return "proxy";
-        case PF_ACTION_CHAIN:  return "chain";
-        case PF_ACTION_BLOCK:  return "block";
-        case PF_ACTION_REJECT: return "reject";
-        default:               return "unknown";
+        case PF_ACTION_DIRECT: return "DIRECT";
+        case PF_ACTION_PROXY:  return "PROXY";
+        case PF_ACTION_CHAIN:  return "CHAIN";
+        case PF_ACTION_BLOCK:  return "BLOCK";
+        case PF_ACTION_REJECT: return "REJECT";
+        default:               return "DIRECT";
     }
 }
 
@@ -108,11 +108,11 @@ pf_proxy_type_t pf_proxy_type_from_str(const char *s)
 pf_action_t pf_action_from_str(const char *s)
 {
     if (!s) return PF_ACTION_DIRECT;
-    if (strcmp(s, "direct") == 0) return PF_ACTION_DIRECT;
-    if (strcmp(s, "proxy")  == 0) return PF_ACTION_PROXY;
-    if (strcmp(s, "chain")  == 0) return PF_ACTION_CHAIN;
-    if (strcmp(s, "block")  == 0) return PF_ACTION_BLOCK;
-    if (strcmp(s, "reject") == 0) return PF_ACTION_REJECT;
+    if (strcasecmp(s, "direct") == 0) return PF_ACTION_DIRECT;
+    if (strcasecmp(s, "proxy")  == 0) return PF_ACTION_PROXY;
+    if (strcasecmp(s, "chain")  == 0) return PF_ACTION_CHAIN;
+    if (strcasecmp(s, "block")  == 0) return PF_ACTION_BLOCK;
+    if (strcasecmp(s, "reject") == 0) return PF_ACTION_REJECT;
     return PF_ACTION_DIRECT;
 }
 
@@ -177,13 +177,18 @@ static cJSON *proxy_to_json(const pf_proxy_t *p)
 static cJSON *rule_to_json(const pf_rule_t *r)
 {
     cJSON *obj = cJSON_CreateObject();
-    cJSON_AddNumberToObject(obj, "id",       (double)r->id);
-    cJSON_AddStringToObject(obj, "name",     r->name);
-    cJSON_AddNumberToObject(obj, "priority", r->priority);
-    cJSON_AddStringToObject(obj, "app_path", r->app_path);
-    cJSON_AddStringToObject(obj, "domain",   r->domain);
-    cJSON_AddStringToObject(obj, "ip_cidr",  r->ip_cidr);
-    cJSON_AddNumberToObject(obj, "dst_port", r->dst_port);
+    cJSON_AddNumberToObject(obj, "id",           (double)r->id);
+    cJSON_AddStringToObject(obj, "name",         r->name);
+    cJSON_AddNumberToObject(obj, "priority",     r->priority);
+    cJSON_AddStringToObject(obj, "match_app",    r->app_path);
+    cJSON_AddStringToObject(obj, "match_domain", r->domain);
+    cJSON_AddStringToObject(obj, "match_ip",     r->ip_cidr);
+    if (r->dst_port > 0) {
+        char ps[8]; snprintf(ps, sizeof(ps), "%u", r->dst_port);
+        cJSON_AddStringToObject(obj, "match_port", ps);
+    } else {
+        cJSON_AddStringToObject(obj, "match_port", "");
+    }
     cJSON_AddStringToObject(obj, "action",   pf_action_str(r->action));
     cJSON_AddNumberToObject(obj, "proxy_id", (double)r->proxy_id);
     cJSON_AddNumberToObject(obj, "chain_id", (double)r->chain_id);
@@ -200,7 +205,7 @@ static cJSON *chain_to_json(const pf_chain_t *c)
     cJSON_AddBoolToObject  (obj, "enabled", c->enabled);
     for (int i = 0; i < c->hop_count; i++)
         cJSON_AddItemToArray(hops, cJSON_CreateNumber((double)c->hops[i]));
-    cJSON_AddItemToObject(obj, "hops", hops);
+    cJSON_AddItemToObject(obj, "hop_proxy_ids", hops);
     return obj;
 }
 
@@ -240,20 +245,26 @@ static void rule_from_json(pf_rule_t *r, cJSON *params)
         snprintf(r->name, sizeof(r->name), "%s", v->valuestring);
     if ((v = cJSON_GetObjectItem(params, "priority")))
         r->priority = (int)v->valuedouble;
-    if ((v = cJSON_GetObjectItem(params, "app_path")))
-        snprintf(r->app_path, sizeof(r->app_path), "%s", v->valuestring);
-    if ((v = cJSON_GetObjectItem(params, "domain")))
-        snprintf(r->domain, sizeof(r->domain), "%s", v->valuestring);
-    if ((v = cJSON_GetObjectItem(params, "ip_cidr")))
-        snprintf(r->ip_cidr, sizeof(r->ip_cidr), "%s", v->valuestring);
-    if ((v = cJSON_GetObjectItem(params, "dst_port")))
-        r->dst_port = (uint16_t)v->valuedouble;
+    /* Accept both frontend names (match_app) and internal names (app_path) */
+    if ((v = cJSON_GetObjectItem(params, "match_app")) || (v = cJSON_GetObjectItem(params, "app_path")))
+        if (v->valuestring) snprintf(r->app_path, sizeof(r->app_path), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "match_domain")) || (v = cJSON_GetObjectItem(params, "domain")))
+        if (v->valuestring) snprintf(r->domain, sizeof(r->domain), "%s", v->valuestring);
+    if ((v = cJSON_GetObjectItem(params, "match_ip")) || (v = cJSON_GetObjectItem(params, "ip_cidr")))
+        if (v->valuestring) snprintf(r->ip_cidr, sizeof(r->ip_cidr), "%s", v->valuestring);
+    /* match_port: accept string ("443") or number */
+    if ((v = cJSON_GetObjectItem(params, "match_port")) || (v = cJSON_GetObjectItem(params, "dst_port"))) {
+        if (cJSON_IsString(v) && v->valuestring && v->valuestring[0])
+            r->dst_port = (uint16_t)atoi(v->valuestring);
+        else if (cJSON_IsNumber(v))
+            r->dst_port = (uint16_t)v->valuedouble;
+    }
     if ((v = cJSON_GetObjectItem(params, "action")))
         r->action = pf_action_from_str(v->valuestring);
     if ((v = cJSON_GetObjectItem(params, "proxy_id")))
-        r->proxy_id = (uint32_t)v->valuedouble;
+        r->proxy_id = v->valuedouble > 0 ? (uint32_t)v->valuedouble : 0;
     if ((v = cJSON_GetObjectItem(params, "chain_id")))
-        r->chain_id = (uint32_t)v->valuedouble;
+        r->chain_id = v->valuedouble > 0 ? (uint32_t)v->valuedouble : 0;
     r->enabled = 1;
     if ((v = cJSON_GetObjectItem(params, "enabled")))
         r->enabled = cJSON_IsTrue(v) ? 1 : 0;
@@ -270,7 +281,8 @@ static void chain_from_json(pf_chain_t *c, cJSON *params)
     c->enabled = 1;
     if ((v = cJSON_GetObjectItem(params, "enabled")))
         c->enabled = cJSON_IsTrue(v) ? 1 : 0;
-    cJSON *hops = cJSON_GetObjectItem(params, "hops");
+    cJSON *hops = cJSON_GetObjectItem(params, "hop_proxy_ids");
+    if (!hops) hops = cJSON_GetObjectItem(params, "hops");
     if (hops && cJSON_IsArray(hops)) {
         int n = cJSON_GetArraySize(hops);
         if (n > PF_MAX_HOPS) n = PF_MAX_HOPS;
@@ -377,9 +389,11 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
 
     /* ── rule.list ───────────────────────────────────────────────────────── */
     } else if (strcmp(method, "rule.list") == 0) {
-        pf_rule_t buf[PF_MAX_RULES];
+        pf_rule_t *buf = calloc(PF_MAX_RULES, sizeof(pf_rule_t));
         int count = 0;
-        if (pf_config_rule_list(&ctx->config, buf, PF_MAX_RULES, &count) == PF_OK) {
+        if (!buf) {
+            cJSON_AddStringToObject(resp, "error", "out of memory");
+        } else if (pf_config_rule_list(&ctx->config, buf, PF_MAX_RULES, &count) == PF_OK) {
             cJSON *arr = cJSON_CreateArray();
             for (int i = 0; i < count; i++)
                 cJSON_AddItemToArray(arr, rule_to_json(&buf[i]));
@@ -387,6 +401,7 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         } else {
             cJSON_AddStringToObject(resp, "error", "db error");
         }
+        free(buf);
 
     /* ── rule.add ────────────────────────────────────────────────────────── */
     } else if (strcmp(method, "rule.add") == 0) {

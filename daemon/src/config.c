@@ -68,7 +68,7 @@ static const char *SCHEMA_DDL =
     "  match_domain TEXT,"
     "  match_ip     TEXT,"
     "  match_port   INTEGER,"
-    "  action       TEXT    NOT NULL CHECK(action IN ('direct','proxy','chain','block','reject')),"
+    "  action       TEXT    NOT NULL,"
     "  proxy_id     INTEGER REFERENCES proxies(id),"
     "  chain_id     INTEGER REFERENCES chains(id),"
     "  created_at   INTEGER NOT NULL,"

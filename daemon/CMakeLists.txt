@@ -159,3 +159,10 @@ target_link_libraries(pf-test-rules PRIVATE
     ${OPENSSL_LIBRARIES}
     ${ARGON2_LIB}
 )
+
+# ── SNI test executable ──────────────────────────────────────────────────────
+add_executable(pf-test-sni tests/test_sni.c src/sni.c)
+target_include_directories(pf-test-sni PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)

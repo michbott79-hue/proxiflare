@@ -241,8 +241,13 @@ pub fn list_system_apps() -> Result<Value, String> {
     use std::path::Path;
 
     let mut apps: Vec<Value> = Vec::new();
-    let dirs = ["/usr/share/applications", "/var/lib/flatpak/exports/share/applications",
-                &format!("{}/.local/share/applications", std::env::var("HOME").unwrap_or_default())];
+    let dirs = [
+        "/usr/share/applications",
+        "/var/lib/flatpak/exports/share/applications",
+        "/var/lib/snapd/desktop/applications",
+        "/snap/current/share/applications",
+        &format!("{}/.local/share/applications", std::env::var("HOME").unwrap_or_default()),
+    ];
 
     for dir in &dirs {
         let path = Path::new(dir);

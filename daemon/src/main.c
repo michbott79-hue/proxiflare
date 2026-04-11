@@ -398,62 +398,79 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     if (rule->action == PF_ACTION_BLOCK || rule->action == PF_ACTION_REJECT)
         return -2;
 
-    if (rule->action != PF_ACTION_PROXY || rule->proxy_id == 0)
-        return -1;
-
-    /* Look up the proxy */
-    pf_proxy_t proxy;
-    if (pf_config_proxy_get(&ctx->config, (int)rule->proxy_id, &proxy) != PF_OK) {
-        pf_log_warn("tproxy: proxy_id %u from rule '%s' not found in DB",
-                    rule->proxy_id, rule->name);
-        return -1;
-    }
-
-    if (!proxy.enabled) {
-        pf_log_warn("tproxy: proxy '%s' (id=%u) is disabled", proxy.name, proxy.id);
-        return -1;
-    }
-
     /* Target: prefer domain over raw IP for DNS-capable proxies */
     const char *target = (match_domain && match_domain[0]) ? match_domain : dst_ip;
-
-    /* Connect through the proxy */
+    const char *via_name = "?";
     int fd = -1;
-    switch (proxy.type) {
-        case PF_PROXY_SOCKS5:
-            fd = pf_socks5_connect(proxy.host, proxy.port, target, dst_port,
-                                   proxy.username, proxy.password);
-            break;
-        case PF_PROXY_SOCKS4:
-            fd = pf_socks4_connect(proxy.host, proxy.port, target, dst_port,
-                                   proxy.username);
-            break;
-        case PF_PROXY_HTTP:
-            fd = pf_http_connect(proxy.host, proxy.port, target, dst_port,
-                                 proxy.username, proxy.password);
-            break;
-        case PF_PROXY_SSH:
-            /* SSH tunneling not yet wired for TPROXY */
-            pf_log_warn("tproxy: SSH proxy not supported in TPROXY path");
-            break;
+
+    if (rule->action == PF_ACTION_PROXY && rule->proxy_id > 0) {
+        /* ── Single proxy routing ─────────────────────────────────────────── */
+        pf_proxy_t proxy;
+        if (pf_config_proxy_get(&ctx->config, (int)rule->proxy_id, &proxy) != PF_OK) {
+            pf_log_warn("tproxy: proxy_id %u from rule '%s' not found in DB",
+                        rule->proxy_id, rule->name);
+            return -1;
+        }
+        if (!proxy.enabled) {
+            pf_log_warn("tproxy: proxy '%s' (id=%u) is disabled", proxy.name, proxy.id);
+            return -1;
+        }
+        via_name = proxy.name;
+        switch (proxy.type) {
+            case PF_PROXY_SOCKS5:
+                fd = pf_socks5_connect(proxy.host, proxy.port, target, dst_port,
+                                       proxy.username, proxy.password);
+                break;
+            case PF_PROXY_SOCKS4:
+                fd = pf_socks4_connect(proxy.host, proxy.port, target, dst_port,
+                                       proxy.username);
+                break;
+            case PF_PROXY_HTTP:
+                fd = pf_http_connect(proxy.host, proxy.port, target, dst_port,
+                                     proxy.username, proxy.password);
+                break;
+            case PF_PROXY_SSH:
+                fd = pf_ssh_connect(&ctx->ssh_pool, &proxy, target, dst_port);
+                break;
+        }
+
+    } else if (rule->action == PF_ACTION_CHAIN && rule->chain_id > 0) {
+        /* ── Chain proxy routing ──────────────────────────────────────────── */
+        pf_chain_t chain;
+        if (pf_config_chain_get(&ctx->config, (int)rule->chain_id, &chain) != PF_OK) {
+            pf_log_warn("tproxy: chain_id %u from rule '%s' not found in DB",
+                        rule->chain_id, rule->name);
+            return -1;
+        }
+        if (!chain.enabled) {
+            pf_log_warn("tproxy: chain '%s' (id=%u) is disabled", chain.name, chain.id);
+            return -1;
+        }
+        via_name = chain.name;
+        pf_proxy_t pbuf[PF_MAX_PROXIES];
+        int pcount = 0;
+        pf_config_proxy_list(&ctx->config, pbuf, PF_MAX_PROXIES, &pcount);
+        fd = pf_chain_connect(&chain, pbuf, pcount, target, dst_port);
+
+    } else {
+        return -1;
     }
 
     if (fd >= 0) {
-        pf_log_info("tproxy: [%s] %s:%d → %s via %s",
-                    rule->name, target, dst_port,
-                    dst_ip ? dst_ip : "?", proxy.name);
+        pf_log_info("tproxy: [%s] %s:%d via %s",
+                    rule->name, target, dst_port, via_name);
 
         /* Build rich log entry for IPC + ring buffer */
         cJSON *event = cJSON_CreateObject();
         cJSON_AddNumberToObject(event, "ts", (double)time(NULL));
         cJSON_AddStringToObject(event, "app", rule->app_path[0] ? rule->app_path : rule->name);
         cJSON_AddStringToObject(event, "rule", rule->name);
-        cJSON_AddStringToObject(event, "proxy", proxy.name);
-        cJSON_AddNumberToObject(event, "proxy_id", (double)proxy.id);
+        cJSON_AddStringToObject(event, "proxy", via_name);
+        cJSON_AddNumberToObject(event, "proxy_id", (double)rule->proxy_id);
         cJSON_AddStringToObject(event, "domain", match_domain ? match_domain : "");
         cJSON_AddStringToObject(event, "dst_ip", dst_ip ? dst_ip : "");
         cJSON_AddNumberToObject(event, "dst_port", (double)dst_port);
-        cJSON_AddStringToObject(event, "action", "PROXY");
+        cJSON_AddStringToObject(event, "action", pf_action_str(rule->action));
         cJSON_AddNumberToObject(event, "success", 1);
         cJSON_AddNumberToObject(event, "bytes_tx", 0);
         cJSON_AddNumberToObject(event, "bytes_rx", 0);
@@ -476,18 +493,18 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
         }
     } else {
         pf_log_error("tproxy: FAILED [%s] %s:%d via %s",
-                     rule->name, target, dst_port, proxy.name);
+                     rule->name, target, dst_port, via_name);
 
         cJSON *event = cJSON_CreateObject();
         cJSON_AddNumberToObject(event, "ts", (double)time(NULL));
         cJSON_AddStringToObject(event, "app", rule->app_path[0] ? rule->app_path : rule->name);
         cJSON_AddStringToObject(event, "rule", rule->name);
-        cJSON_AddStringToObject(event, "proxy", proxy.name);
-        cJSON_AddNumberToObject(event, "proxy_id", (double)proxy.id);
+        cJSON_AddStringToObject(event, "proxy", via_name);
+        cJSON_AddNumberToObject(event, "proxy_id", (double)rule->proxy_id);
         cJSON_AddStringToObject(event, "domain", match_domain ? match_domain : "");
         cJSON_AddStringToObject(event, "dst_ip", dst_ip ? dst_ip : "");
         cJSON_AddNumberToObject(event, "dst_port", (double)dst_port);
-        cJSON_AddStringToObject(event, "action", "PROXY");
+        cJSON_AddStringToObject(event, "action", pf_action_str(rule->action));
         cJSON_AddNumberToObject(event, "success", 0);
         cJSON_AddNumberToObject(event, "bytes_tx", 0);
         cJSON_AddNumberToObject(event, "bytes_rx", 0);
@@ -770,6 +787,54 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                          "Remove references first.", refs);
                 cJSON_AddStringToObject(resp, "error", msg);
             } else if (pf_config_chain_delete(&ctx->config, id) == PF_OK) {
+                cJSON_AddStringToObject(resp, "result", "ok");
+            } else {
+                cJSON_AddStringToObject(resp, "error", "db error");
+            }
+        }
+
+    /* ── chain.test ──────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "chain.test") == 0) {
+        cJSON *id_v = params ? cJSON_GetObjectItem(params, "id") : NULL;
+        if (!id_v) {
+            cJSON_AddStringToObject(resp, "error", "missing id");
+        } else {
+            int id = (int)id_v->valuedouble;
+            pf_chain_t c;
+            if (pf_config_chain_get(&ctx->config, id, &c) != PF_OK) {
+                cJSON_AddStringToObject(resp, "error", "chain not found");
+            } else {
+                pf_proxy_t pbuf[PF_MAX_PROXIES];
+                int pcount = 0;
+                pf_config_proxy_list(&ctx->config, pbuf, PF_MAX_PROXIES, &pcount);
+                int latency = pf_chain_test(&c, pbuf, pcount);
+                cJSON *r = cJSON_CreateObject();
+                cJSON_AddNumberToObject(r, "latency_ms", latency);
+                cJSON_AddStringToObject(r, "health",
+                    latency >= 0 ? (latency > 2000 ? "slow" : "online") : "offline");
+                cJSON_AddItemToObject(resp, "result", r);
+            }
+        }
+
+    /* ── rule.reorder ───────────────────────────────────────────────────── */
+    } else if (strcmp(method, "rule.reorder") == 0) {
+        cJSON *ids = params ? cJSON_GetObjectItem(params, "ids") : NULL;
+        if (!ids || !cJSON_IsArray(ids)) {
+            cJSON_AddStringToObject(resp, "error", "missing ids array");
+        } else {
+            int n = cJSON_GetArraySize(ids);
+            int ok = 1;
+            for (int ri = 0; ri < n; ri++) {
+                int rule_id = (int)cJSON_GetArrayItem(ids, ri)->valuedouble;
+                /* Set priority = position in the new order */
+                char sql[128];
+                snprintf(sql, sizeof(sql),
+                    "UPDATE rules SET priority=%d WHERE id=%d;", ri, rule_id);
+                if (sqlite3_exec(ctx->config.db, sql, NULL, NULL, NULL) != SQLITE_OK)
+                    ok = 0;
+            }
+            if (ok) {
+                pf_rules_load(ctx->ruleset, &ctx->config);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
                 cJSON_AddStringToObject(resp, "error", "db error");

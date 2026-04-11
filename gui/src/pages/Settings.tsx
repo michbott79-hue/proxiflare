@@ -35,6 +35,10 @@ export default function Settings({ daemon }: Props) {
   const [bootEnabled, setBootEnabled]     = useState(false);
   const [bootToggling, setBootToggling]   = useState(false);
 
+  /* Log to disk state */
+  const [logDisk, setLogDisk]             = useState(true);
+  const [logToggling, setLogToggling]     = useState(false);
+
   /* DNS leak protection state */
   const [dnsEnabled, setDnsEnabled]       = useState(false);
   const [dnsServer, setDnsServer]         = useState('1.1.1.1');
@@ -63,6 +67,9 @@ export default function Settings({ daemon }: Props) {
       .catch(() => {});
     api.configGet('boot_enabled')
       .then(v => setBootEnabled(v === 'true' || v === '1'))
+      .catch(() => {});
+    api.configGet('log_disk_enabled')
+      .then(v => setLogDisk(v !== 'false' && v !== '0'))
       .catch(() => {});
   }, [daemon.connected]);
 
@@ -367,10 +374,23 @@ export default function Settings({ daemon }: Props) {
           <div className="flex items-center justify-between">
             <span className="text-sm">Log to disk</span>
             <button
-              className="relative h-5 w-9 rounded-full bg-[#2d3348] transition-colors"
-              title="Not yet implemented"
+              onClick={async () => {
+                setLogToggling(true);
+                try {
+                  const next = !logDisk;
+                  await api.configSet('log_disk_enabled', next ? 'true' : 'false');
+                  setLogDisk(next);
+                } catch (e) { console.error('Log toggle error:', e); }
+                finally { setLogToggling(false); }
+              }}
+              disabled={logToggling}
+              className={`relative h-5 w-9 rounded-full transition-colors disabled:opacity-50 ${
+                logDisk ? 'bg-[#6366f1]' : 'bg-[#2d3348]'
+              }`}
             >
-              <span className="absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white" />
+              <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                logDisk ? 'left-[calc(100%-1.125rem)]' : 'left-0.5'
+              }`} />
             </button>
           </div>
           <div className="flex items-center justify-between">

@@ -146,9 +146,19 @@ static void on_process_event(pid_t pid, const char *exe_path, bool is_exec, void
 
     if (is_exec) {
         if (!ctx->ruleset) return;
+        /* Match by full path first, then by basename for snap/flatpak apps */
         const pf_rule_t *rule = pf_rules_match(ctx->ruleset, exe_path, NULL, NULL, 0);
-        if (rule && rule->action != PF_ACTION_DIRECT) {
+        if (!rule || rule->action == PF_ACTION_DIRECT) {
+            /* Extract basename and retry — handles snap paths like
+             * /snap/firefox/8054/usr/lib/firefox/firefox matching "firefox" */
+            const char *base = strrchr(exe_path, '/');
+            base = base ? base + 1 : exe_path;
+            rule = pf_rules_match(ctx->ruleset, base, NULL, NULL, 0);
+        }
+        if (rule && rule->action != PF_ACTION_DIRECT && rule->app_path[0]) {
             pf_cgroup_assign_pid((int)rule->id, pid);
+            pf_log_info("process_monitor: PID %d (%s) → rule '%s' (proxy_id=%u)",
+                        pid, exe_path, rule->name, rule->proxy_id);
         }
     } else {
         pf_cgroup_remove_pid(pid);

@@ -19,13 +19,36 @@
  *   "sky.ch"   — exact (case-insensitive)
  *   other      — fnmatch(FNM_CASEFOLD) fallback
  * ───────────────────────────────────────────────────────────────────────────── */
+/* Match a single domain pattern (internal) */
+static bool match_domain_single(const char *pattern, size_t plen, const char *domain, size_t dlen);
+
 bool pf_match_domain(const char *pattern, const char *domain)
 {
     if (!pattern || !domain) return false;
 
-    size_t plen = strlen(pattern);
-    size_t dlen = strlen(domain);
+    /* Multi-domain: comma-separated patterns (e.g. "*.google.com, *.youtube.com, netflix.com") */
+    if (strchr(pattern, ',')) {
+        char buf[PF_DOMAIN_MAX * 4];
+        snprintf(buf, sizeof(buf), "%s", pattern);
+        char *saveptr;
+        char *tok = strtok_r(buf, ",", &saveptr);
+        while (tok) {
+            /* Trim whitespace */
+            while (*tok == ' ') tok++;
+            char *end = tok + strlen(tok) - 1;
+            while (end > tok && *end == ' ') *end-- = '\0';
+            if (*tok && match_domain_single(tok, strlen(tok), domain, strlen(domain)))
+                return true;
+            tok = strtok_r(NULL, ",", &saveptr);
+        }
+        return false;
+    }
 
+    return match_domain_single(pattern, strlen(pattern), domain, strlen(domain));
+}
+
+static bool match_domain_single(const char *pattern, size_t plen, const char *domain, size_t dlen)
+{
     /* Contains pattern: starts AND ends with '*', e.g. "*streaming*" */
     if (plen >= 2 && pattern[0] == '*' && pattern[plen - 1] == '*') {
         /* extract the inner needle */
@@ -88,20 +111,30 @@ bool pf_match_app(const char *pattern, const char *app_path)
 {
     if (!pattern || !app_path) return false;
 
-    /* No '/' in pattern → compare against basename only */
-    if (strchr(pattern, '/') == NULL) {
-        /* We need a mutable copy for basename(3) which may modify the string */
-        char tmp[PF_PATH_MAX];
-        snprintf(tmp, sizeof(tmp), "%s", app_path);
-        const char *base = basename(tmp);
-        return strcmp(pattern, base) == 0;
-    }
+    /* Extract basenames for both pattern and app_path */
+    const char *pat_base = strrchr(pattern, '/');
+    pat_base = pat_base ? pat_base + 1 : pattern;
 
-    /* Exact path or glob */
-    if (strchr(pattern, '*') == NULL && strchr(pattern, '?') == NULL)
-        return strcmp(pattern, app_path) == 0;
+    char tmp[PF_PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", app_path);
+    const char *app_base = basename(tmp);
 
-    return fnmatch(pattern, app_path, 0) == 0;
+    /* 1. Exact path match */
+    if (strcmp(pattern, app_path) == 0) return true;
+
+    /* 2. Basename match — handles snap/flatpak:
+     *    pattern="/snap/bin/firefox" (basename="firefox")
+     *    app_path="/snap/firefox/8054/usr/lib/firefox/firefox" (basename="firefox")
+     *    → match! */
+    if (strcmp(pat_base, app_base) == 0) return true;
+
+    /* 3. Simple name match (no '/' in pattern): "firefox" matches any path ending in /firefox */
+    if (strchr(pattern, '/') == NULL && strcmp(pattern, app_base) == 0) return true;
+
+    /* 4. Glob match */
+    if (fnmatch(pattern, app_path, 0) == 0) return true;
+
+    return false;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────

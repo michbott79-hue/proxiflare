@@ -310,12 +310,39 @@ export default function Rules() {
                 )}
               </div>
 
-              {/* Match Domain + IP + Port */}
+              {/* Match Domains — multi-domain tag input */}
               <div>
-                <label className="mb-1 block text-xs text-[#64748b]">Match Domain</label>
-                <input type="text" value={modal.rule.match_domain || ''} onChange={e => updateModal('match_domain', e.target.value)}
-                  placeholder="e.g. *.google.com"
-                  className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]" />
+                <label className="mb-1 block text-xs text-[#64748b]">Match Domains</label>
+                <div className="rounded-md border border-[#2d3348] bg-[#232733] px-2 py-1.5 min-h-[38px] flex flex-wrap gap-1.5 items-center focus-within:border-[#6366f1]">
+                  {(modal.rule.match_domain || '').split(',').filter(d => d.trim()).map((d, i) => (
+                    <span key={i} className="inline-flex items-center gap-1 rounded bg-[#22c55e]/15 px-2 py-0.5 text-xs text-[#4ade80]">
+                      {d.trim()}
+                      <button type="button" onClick={() => {
+                        const domains = (modal.rule?.match_domain || '').split(',').filter(x => x.trim());
+                        domains.splice(i, 1);
+                        updateModal('match_domain', domains.join(', '));
+                      }} className="ml-0.5 text-[#4ade80]/60 hover:text-[#ef4444]">x</button>
+                    </span>
+                  ))}
+                  <input
+                    type="text"
+                    placeholder={!(modal.rule.match_domain || '').trim() ? 'e.g. *.google.com — press Enter to add' : 'Add domain...'}
+                    className="flex-1 min-w-[120px] bg-transparent text-sm text-[#e2e8f0] placeholder-[#64748b] outline-none"
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' || e.key === ',') {
+                        e.preventDefault();
+                        const val = (e.target as HTMLInputElement).value.trim().replace(/,$/,'');
+                        if (val) {
+                          const existing = (modal.rule?.match_domain || '').split(',').filter(x => x.trim());
+                          existing.push(val);
+                          updateModal('match_domain', existing.join(', '));
+                          (e.target as HTMLInputElement).value = '';
+                        }
+                      }
+                    }}
+                  />
+                </div>
+                <p className="mt-1 text-[10px] text-[#64748b]">Wildcards: *.google.com, *.ch, *streaming* — Enter per aggiungere</p>
               </div>
 
               <div className="grid grid-cols-2 gap-3">

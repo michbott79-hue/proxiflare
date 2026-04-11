@@ -14,6 +14,9 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <linux/netfilter_ipv4.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -1266,6 +1269,148 @@ static void *mitm_handshake_thread(void *arg_raw)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * TPROXY accept thread — runs the entire accept+proxy_connect+MITM flow
+ * in a background thread so the main epoll loop stays responsive.
+ *
+ * Receives only the raw accepted client_fd. Does everything:
+ * 1. SO_ORIGINAL_DST to recover destination
+ * 2. SNI peek
+ * 3. Rule match + proxy connect (the slow part: 200-1000ms)
+ * 4. MITM SSL handshake (if enabled)
+ * 5. Register fds in main epoll
+ * ────────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    int       client_fd;
+    pf_ctx_t *ctx;
+} accept_thread_arg_t;
+
+static void *tproxy_accept_thread(void *raw)
+{
+    accept_thread_arg_t *arg = (accept_thread_arg_t *)raw;
+    int cfd = arg->client_fd;
+    pf_ctx_t *ctx = arg->ctx;
+    free(arg);
+
+    /* 1. Recover original destination */
+    struct sockaddr_in orig_dst;
+    socklen_t orig_len = sizeof(orig_dst);
+    if (getsockopt(cfd, SOL_IP, SO_ORIGINAL_DST, &orig_dst, &orig_len) < 0) {
+        close(cfd);
+        return NULL;
+    }
+
+    char dst_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &orig_dst.sin_addr, dst_ip, sizeof(dst_ip));
+    int dst_port = ntohs(orig_dst.sin_port);
+
+    /* 2. Peek for TLS/SNI (100ms timeout) */
+    uint8_t peek_buf[4096];
+    char domain[PF_DOMAIN_MAX] = {0};
+    bool is_tls = false;
+
+    {
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    ssize_t n = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK);
+    {
+        struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    }
+    if (n > 0 && peek_buf[0] == 0x16) {
+        pf_sni_extract(peek_buf, (size_t)n, domain, sizeof(domain));
+        is_tls = true;
+    }
+
+    /* 3. Proxy connect via callback (the slow blocking part) */
+    int proxy_fd = -1;
+    if (ctx->tproxy.connect_cb) {
+        proxy_fd = ctx->tproxy.connect_cb(dst_ip, dst_port, domain,
+                                           ctx->tproxy.connect_userdata);
+        if (proxy_fd == -2) { close(cfd); return NULL; } /* BLOCK */
+        if (proxy_fd < 0) {
+            /* DIRECT: connect to original destination */
+            proxy_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (proxy_fd < 0) { close(cfd); return NULL; }
+            struct sockaddr_in da = { .sin_family = AF_INET, .sin_port = htons((uint16_t)dst_port) };
+            inet_pton(AF_INET, dst_ip, &da.sin_addr);
+            if (connect(proxy_fd, (struct sockaddr *)&da, sizeof(da)) < 0) {
+                close(proxy_fd); close(cfd); return NULL;
+            }
+        }
+    } else {
+        close(cfd); return NULL;
+    }
+
+    /* 4. Find a free slot in the connection table */
+    int slot = -1;
+    for (int i = 0; i < PF_MAX_CONNECTIONS; i++) {
+        if (!ctx->tproxy.conns[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        pf_log_warn("tproxy: connection table full");
+        close(proxy_fd); close(cfd); return NULL;
+    }
+
+    pf_connection_t *c = &ctx->tproxy.conns[slot];
+    memset(c, 0, sizeof(*c));
+    c->client_fd = cfd;
+    c->proxy_fd  = proxy_fd;
+    c->dst_port  = dst_port;
+    c->proxy_id  = -1;
+    c->active    = true;
+    c->is_tls    = is_tls;
+    strncpy(c->dst_ip, dst_ip, sizeof(c->dst_ip) - 1);
+    strncpy(c->domain, domain, sizeof(c->domain) - 1);
+    ctx->tproxy.conn_count++;
+
+    /* 5. MITM TLS handshake (if enabled) */
+    if (ctx->mitm.enabled && ctx->mitm.ca_key && is_tls && domain[0]) {
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        c->server_ssl = pf_mitm_wrap_server(&ctx->mitm, proxy_fd, domain);
+        if (c->server_ssl) {
+            c->client_ssl = pf_mitm_wrap_client(&ctx->mitm, cfd, domain);
+            if (c->client_ssl) {
+                c->inspect = true;
+            } else {
+                SSL_free(c->server_ssl); c->server_ssl = NULL;
+            }
+        }
+
+        struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
+        setsockopt(proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+        setsockopt(proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+    } else if (ctx->mitm.enabled && !is_tls) {
+        c->inspect = true;
+    }
+
+    /* 6. Set non-blocking and register in epoll */
+    {
+        int fl = fcntl(cfd, F_GETFL, 0);
+        fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+        fl = fcntl(proxy_fd, F_GETFL, 0);
+        fcntl(proxy_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = cfd;
+    epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, cfd, &ev);
+    ev.data.fd = proxy_fd;
+    epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, proxy_fd, &ev);
+
+    return NULL;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * PID file
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -1574,39 +1719,35 @@ int main(int argc, char *argv[])
                 }
 
                 /* ── TPROXY: new connection ────────────────────────────── */
-                /* The entire accept+proxy_connect+MITM runs in a thread
-                 * to keep the main epoll loop responsive for DNS/IPC. */
+                /* pf_tproxy_accept blocks (proxy connect 200-1000ms).
+                 * Run the entire accept in a detached thread so the main
+                 * epoll loop stays responsive for DNS/IPC/relay. */
                 if (ctx->tproxy.listen_fd > 0 && fd == ctx->tproxy.listen_fd) {
-                    int slot = pf_tproxy_accept(&ctx->tproxy);
-                    if (slot >= 0 && ctx->tproxy.conns[slot].active) {
-                        pf_connection_t *c = &ctx->tproxy.conns[slot];
+                    /* Quick non-blocking accept — just get the client fd */
+                    struct sockaddr_in peer;
+                    socklen_t peerlen = sizeof(peer);
+                    int cfd = accept(ctx->tproxy.listen_fd,
+                                     (struct sockaddr *)&peer, &peerlen);
+                    if (cfd >= 0) {
+                        /* Pack args and spawn thread for the heavy work */
+                        typedef struct {
+                            int              client_fd;
+                            pf_ctx_t        *ctx;
+                        } accept_thread_arg_t;
 
-                        /* MITM TLS: handshake in thread */
-                        if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
-                            mitm_thread_arg_t *arg = malloc(sizeof(mitm_thread_arg_t));
-                            if (arg) {
-                                arg->mitm     = &ctx->mitm;
-                                arg->conn     = c;
-                                arg->epoll_fd = ctx->epoll_fd;
-                                arg->slot     = slot;
-                                arg->tproxy   = &ctx->tproxy;
-                                pthread_t tid;
-                                if (pthread_create(&tid, NULL, mitm_handshake_thread, arg) == 0) {
-                                    pthread_detach(tid);
-                                } else {
-                                    free(arg);
-                                    epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
-                                    epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
-                                }
+                        accept_thread_arg_t *ata = malloc(sizeof(accept_thread_arg_t));
+                        if (ata) {
+                            ata->client_fd = cfd;
+                            ata->ctx       = ctx;
+                            pthread_t tid;
+                            if (pthread_create(&tid, NULL, tproxy_accept_thread, ata) == 0) {
+                                pthread_detach(tid);
                             } else {
-                                epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
-                                epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
+                                free(ata);
+                                close(cfd);
                             }
                         } else {
-                            /* Non-TLS or no MITM — register immediately */
-                            if (ctx->mitm.enabled && !c->is_tls) c->inspect = true;
-                            epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
-                            epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
+                            close(cfd);
                         }
                     }
                     continue;

@@ -189,7 +189,7 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
     }
 
     /* ── Peek first bytes for TLS/SNI detection ──────────────────────────── */
-    uint8_t peek_buf[512];
+    uint8_t peek_buf[4096]; /* Must be large enough for full TLS ClientHello */
     char    domain[PF_DOMAIN_MAX] = {0};
 
     ssize_t n = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT);

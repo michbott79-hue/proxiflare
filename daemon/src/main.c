@@ -823,6 +823,13 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
     } else if (strcmp(method, "system.version") == 0) {
         cJSON_AddStringToObject(resp, "result", PF_VERSION);
 
+    /* ── system.shutdown ─────────────────────────────────────────────────── */
+    } else if (strcmp(method, "system.shutdown") == 0) {
+        pf_log_info("Shutdown requested via IPC");
+        cJSON_AddStringToObject(resp, "result", "shutting down");
+        /* Set running=false to exit main loop after sending response */
+        ctx->running = 0;
+
     /* ── dns_leak.enable ────────────────────────────────────────────────── */
     } else if (strcmp(method, "dns_leak.enable") == 0) {
         cJSON *server_v = params ? cJSON_GetObjectItem(params, "dns_server") : NULL;

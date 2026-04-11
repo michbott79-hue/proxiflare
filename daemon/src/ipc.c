@@ -2,6 +2,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -51,6 +52,9 @@ int pf_ipc_init(pf_ipc_t *ipc, const char *socket_path, pf_ctx_t *ctx,
         close(fd);
         return -1;
     }
+
+    /* Make socket world-accessible so GUI (non-root) can connect */
+    chmod(socket_path, 0777);
 
     if (listen(fd, 5) < 0) {
         perror("ipc: listen");

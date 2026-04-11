@@ -139,3 +139,23 @@ target_link_libraries(pf-test-crypto PRIVATE
     ${OPENSSL_LIBRARIES}
     ${ARGON2_LIB}
 )
+
+# ── Rules test executable ────────────────────────────────────────────────────
+add_executable(pf-test-rules tests/test_rules.c src/rules.c src/config.c vendor/cJSON/cJSON.c)
+target_include_directories(pf-test-rules PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/cJSON
+    ${SQLITE3_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIRS}
+    ${ARGON2_INCLUDE_DIR}
+)
+target_link_directories(pf-test-rules PRIVATE
+    ${SQLITE3_LIBRARY_DIRS}
+    ${OPENSSL_LIBRARY_DIRS}
+)
+target_link_libraries(pf-test-rules PRIVATE
+    ${SQLITE3_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${ARGON2_LIB}
+)

@@ -1574,23 +1574,15 @@ int main(int argc, char *argv[])
                 }
 
                 /* ── TPROXY: new connection ────────────────────────────── */
+                /* The entire accept+proxy_connect+MITM runs in a thread
+                 * to keep the main epoll loop responsive for DNS/IPC. */
                 if (ctx->tproxy.listen_fd > 0 && fd == ctx->tproxy.listen_fd) {
                     int slot = pf_tproxy_accept(&ctx->tproxy);
                     if (slot >= 0 && ctx->tproxy.conns[slot].active) {
                         pf_connection_t *c = &ctx->tproxy.conns[slot];
 
-                        /* For non-TLS HTTP with inspect enabled, set inspect flag
-                         * and register immediately — no handshake needed */
-                        if (ctx->mitm.enabled && !c->is_tls) {
-                            c->inspect = true;
-                            epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
-                            epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
-                        }
-                        /* MITM TLS interception: spawn a thread for the SSL handshake
-                         * to avoid blocking the main epoll loop (which would starve
-                         * DNS NFQUEUE and freeze all browsing). The thread does the
-                         * handshake, then registers fds in epoll when done. */
-                        else if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
+                        /* MITM TLS: handshake in thread */
+                        if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
                             mitm_thread_arg_t *arg = malloc(sizeof(mitm_thread_arg_t));
                             if (arg) {
                                 arg->mitm     = &ctx->mitm;
@@ -1598,14 +1590,11 @@ int main(int argc, char *argv[])
                                 arg->epoll_fd = ctx->epoll_fd;
                                 arg->slot     = slot;
                                 arg->tproxy   = &ctx->tproxy;
-
                                 pthread_t tid;
                                 if (pthread_create(&tid, NULL, mitm_handshake_thread, arg) == 0) {
                                     pthread_detach(tid);
-                                    /* DON'T register in epoll yet — thread will do it */
                                 } else {
                                     free(arg);
-                                    /* Fallback: register without MITM */
                                     epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
                                     epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                                 }
@@ -1613,9 +1602,9 @@ int main(int argc, char *argv[])
                                 epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
                                 epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                             }
-                        }
-                        /* No MITM — register normally */
-                        else {
+                        } else {
+                            /* Non-TLS or no MITM — register immediately */
+                            if (ctx->mitm.enabled && !c->is_tls) c->inspect = true;
                             epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
                             epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                         }

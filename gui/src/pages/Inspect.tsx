@@ -78,10 +78,13 @@ export default function Inspect() {
 
   useEffect(() => {
     loadStatus();
-    poll();
-    pollRef.current = setInterval(poll, 500);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [loadStatus, poll]);
+    /* Only poll when capture is active — prevents hammering daemon IPC */
+    if (status?.enabled) {
+      poll();
+      pollRef.current = setInterval(poll, 2000);
+    }
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  }, [loadStatus, poll, status?.enabled]);
 
   async function handleToggle() {
     setToggling(true);

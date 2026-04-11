@@ -54,10 +54,10 @@ int pf_cgroup_init(void)
         return PF_ERR;
     }
 
-    /* Enable memory and net_cls controllers for child cgroups */
-    const char *subtree_path = PF_CGROUP_BASE "/cgroup.subtree_control";
-    /* Ignore errors — some controllers may not be available */
-    write_file(subtree_path, "+net_cls");
+    /* For cgroupv2 nftables socket matching, we only need the cgroup hierarchy
+     * to exist — no controllers need to be enabled in subtree_control.
+     * The nftables "socket cgroupv2" matcher works purely based on the
+     * cgroup directory membership, not on any specific controller. */
 
     pf_log_info("cgroup: base hierarchy created at %s", PF_CGROUP_BASE);
     return PF_OK;

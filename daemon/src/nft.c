@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Internal helper: pipe nft commands via "nft -f -"
@@ -145,16 +146,25 @@ int pf_nft_setup_tproxy(int port)
 
 int pf_nft_add_cgroup_mark(int rule_id)
 {
-    char cmd[256];
+    /* Ensure the cgroup directory exists (idempotent) */
+    char cg_path[256];
+    snprintf(cg_path, sizeof(cg_path), "/sys/fs/cgroup/proxiflare/rule_%d", rule_id);
+    mkdir(cg_path, 0755);
+
+    /* Use cgroupv2 socket matching — this is the correct nftables syntax
+     * for matching processes in a specific cgroup hierarchy node.
+     * "level 2" means 2 levels deep in the hierarchy: proxiflare/rule_N */
+    char cmd[512];
     snprintf(cmd, sizeof(cmd),
-        "add rule inet proxiflare output meta cgroup %d meta mark set 1\n",
+        "add rule inet proxiflare output socket cgroupv2 level 2 "
+        "\"proxiflare/rule_%d\" meta mark set 1\n",
         rule_id);
 
     if (nft_run(cmd) != PF_OK) {
         pf_log_error("nft: failed to add cgroup mark for rule_%d", rule_id);
         return PF_ERR;
     }
-    pf_log_info("nft: cgroup mark rule added for rule_%d", rule_id);
+    pf_log_info("nft: cgroup mark rule added for rule_%d (cgroupv2)", rule_id);
     return PF_OK;
 }
 

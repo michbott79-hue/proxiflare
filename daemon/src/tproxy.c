@@ -198,12 +198,70 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
         pf_sni_extract(peek_buf, (size_t)n, domain, sizeof(domain));
     }
 
+    /* ── Connect through proxy via callback ─────────────────────────────── */
+    int proxy_fd = -1;
+
+    if (tp->connect_cb) {
+        proxy_fd = tp->connect_cb(dst_ip, dst_port, domain, tp->connect_userdata);
+
+        if (proxy_fd == -2) {
+            /* BLOCK action — drop connection */
+            pf_log_info("tproxy: BLOCKED connection to %s:%d%s%s",
+                        dst_ip, dst_port,
+                        domain[0] ? " domain=" : "",
+                        domain[0] ? domain : "");
+            close(cfd);
+            return PF_OK;
+        }
+
+        if (proxy_fd < 0) {
+            /* DIRECT — no proxy configured or no matching rule.
+             * For now, close the connection since TPROXY can't do direct passthrough
+             * (the packet was already redirected to us). We need to connect directly
+             * to the original destination and relay. */
+            proxy_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (proxy_fd < 0) {
+                pf_log_error("tproxy: direct connect socket() failed: %s", strerror(errno));
+                close(cfd);
+                return PF_ERR;
+            }
+            struct sockaddr_in dst_addr = {
+                .sin_family = AF_INET,
+                .sin_port   = htons((uint16_t)dst_port),
+            };
+            inet_pton(AF_INET, dst_ip, &dst_addr.sin_addr);
+            if (connect(proxy_fd, (struct sockaddr *)&dst_addr, sizeof(dst_addr)) < 0) {
+                pf_log_error("tproxy: direct connect to %s:%d failed: %s",
+                             dst_ip, dst_port, strerror(errno));
+                close(proxy_fd);
+                close(cfd);
+                return PF_ERR;
+            }
+            pf_log_info("tproxy: DIRECT relay to %s:%d%s%s",
+                        dst_ip, dst_port,
+                        domain[0] ? " domain=" : "",
+                        domain[0] ? domain : "");
+        } else {
+            pf_log_info("tproxy: PROXY relay to %s:%d%s%s (proxy_fd=%d)",
+                        dst_ip, dst_port,
+                        domain[0] ? " domain=" : "",
+                        domain[0] ? domain : "",
+                        proxy_fd);
+        }
+    } else {
+        /* No callback set — can't route, close */
+        pf_log_warn("tproxy: no connect callback set, dropping connection to %s:%d",
+                     dst_ip, dst_port);
+        close(cfd);
+        return PF_ERR;
+    }
+
     /* ── Populate slot ───────────────────────────────────────────────────── */
     pf_connection_t *conn = &tp->conns[slot];
     memset(conn, 0, sizeof(*conn));
 
     conn->client_fd = cfd;
-    conn->proxy_fd  = -1;
+    conn->proxy_fd  = proxy_fd;
     conn->dst_port  = dst_port;
     conn->proxy_id  = -1;
     conn->active    = true;
@@ -212,12 +270,8 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
     strncpy(conn->domain, domain, sizeof(conn->domain) - 1);
 
     set_nonblocking(cfd);
+    set_nonblocking(proxy_fd);
     tp->conn_count++;
-
-    pf_log_info("tproxy: accepted connection to %s:%d%s%s",
-                dst_ip, dst_port,
-                domain[0] ? " SNI=" : "",
-                domain[0] ? domain : "");
 
     return slot;
 }
@@ -318,4 +372,15 @@ void pf_tproxy_close_conn(pf_tproxy_t *tp, int conn_idx)
 
     if (tp->conn_count > 0)
         tp->conn_count--;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_tproxy_set_connect_cb
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+void pf_tproxy_set_connect_cb(pf_tproxy_t *tp, pf_tproxy_connect_cb cb, void *userdata)
+{
+    if (!tp) return;
+    tp->connect_cb      = cb;
+    tp->connect_userdata = userdata;
 }

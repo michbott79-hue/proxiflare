@@ -39,4 +39,7 @@ int pf_config_chain_delete(pf_config_t *cfg, int id);
 int pf_config_get(pf_config_t *cfg, const char *key, char *value, int max_len);
 int pf_config_set(pf_config_t *cfg, const char *key, const char *value);
 
+/* Last inserted row ID (wraps sqlite3_last_insert_rowid) */
+int pf_config_last_id(pf_config_t *cfg);
+
 #endif /* PF_CONFIG_H */

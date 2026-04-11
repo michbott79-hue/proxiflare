@@ -294,6 +294,117 @@ static void chain_from_json(pf_chain_t *c, cJSON *params)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * TPROXY proxy connect callback
+ *
+ * Called by tproxy.c when a new redirected connection is accepted.
+ * Looks up the destination in the DNS cache and rules to determine
+ * which proxy (if any) to route through.
+ *
+ * Returns: connected fd (>= 0) on proxy success,
+ *          -1 for DIRECT (no proxy match),
+ *          -2 for BLOCK.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
+                                    const char *domain, void *userdata)
+{
+    pf_ctx_t *ctx = (pf_ctx_t *)userdata;
+    if (!ctx || !ctx->ruleset) return -1;
+
+    /* Try DNS cache first for domain resolution + cached rule match */
+    const char *match_domain = (domain && domain[0]) ? domain : NULL;
+    const pf_dns_entry_t *dns_entry = NULL;
+
+    if (!match_domain && dst_ip && dst_ip[0]) {
+        dns_entry = pf_dns_lookup(&ctx->dns, dst_ip);
+        if (dns_entry && dns_entry->domain[0])
+            match_domain = dns_entry->domain;
+    }
+
+    /* Match against rules */
+    const pf_rule_t *rule = pf_rules_match(ctx->ruleset, NULL, match_domain,
+                                           dst_ip, dst_port);
+    if (!rule || rule->action == PF_ACTION_DIRECT)
+        return -1;  /* direct / no match */
+
+    if (rule->action == PF_ACTION_BLOCK || rule->action == PF_ACTION_REJECT)
+        return -2;  /* block */
+
+    if (rule->action != PF_ACTION_PROXY || rule->proxy_id == 0)
+        return -1;  /* only PROXY action supported for now */
+
+    /* Look up the proxy */
+    pf_proxy_t proxy;
+    if (pf_config_proxy_get(&ctx->config, (int)rule->proxy_id, &proxy) != PF_OK) {
+        pf_log_warn("tproxy: proxy_id %u from rule '%s' not found in DB",
+                    rule->proxy_id, rule->name);
+        return -1;
+    }
+
+    if (!proxy.enabled) {
+        pf_log_warn("tproxy: proxy '%s' (id=%u) is disabled", proxy.name, proxy.id);
+        return -1;
+    }
+
+    /* Target: prefer domain over raw IP for DNS-capable proxies */
+    const char *target = (match_domain && match_domain[0]) ? match_domain : dst_ip;
+
+    /* Connect through the proxy */
+    int fd = -1;
+    switch (proxy.type) {
+        case PF_PROXY_SOCKS5:
+            fd = pf_socks5_connect(proxy.host, proxy.port, target, dst_port,
+                                   proxy.username, proxy.password);
+            break;
+        case PF_PROXY_SOCKS4:
+            fd = pf_socks4_connect(proxy.host, proxy.port, target, dst_port,
+                                   proxy.username);
+            break;
+        case PF_PROXY_HTTP:
+            fd = pf_http_connect(proxy.host, proxy.port, target, dst_port,
+                                 proxy.username, proxy.password);
+            break;
+        case PF_PROXY_SSH:
+            /* SSH tunneling not yet wired for TPROXY */
+            pf_log_warn("tproxy: SSH proxy not supported in TPROXY path");
+            break;
+    }
+
+    if (fd >= 0) {
+        pf_log_info("tproxy: connected via proxy '%s' (%s:%d) to %s:%d",
+                    proxy.name, proxy.host, proxy.port, target, dst_port);
+    } else {
+        pf_log_error("tproxy: failed to connect via proxy '%s' (%s:%d) to %s:%d",
+                     proxy.name, proxy.host, proxy.port, target, dst_port);
+    }
+
+    return fd;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Setup cgroups + nftables marks for all existing app-based rules
+ * Called at daemon startup to restore routing state.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+static void setup_cgroups_for_existing_rules(pf_ctx_t *ctx)
+{
+    if (!ctx->ruleset) return;
+
+    int count = 0;
+    for (int i = 0; i < ctx->ruleset->count; i++) {
+        const pf_rule_t *r = &ctx->ruleset->rules[i];
+        if (r->app_path[0] && r->enabled && r->action != PF_ACTION_DIRECT) {
+            pf_cgroup_create_rule((int)r->id);
+            pf_nft_add_cgroup_mark((int)r->id);
+            count++;
+        }
+    }
+
+    if (count > 0)
+        pf_log_info("cgroup/nft: restored %d app-based rule cgroups", count);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * IPC request handler
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -412,6 +523,16 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             pf_rule_t r;
             rule_from_json(&r, params);
             if (pf_config_rule_add(&ctx->config, &r) == PF_OK) {
+                int new_id = pf_config_last_id(&ctx->config);
+
+                /* Set up cgroup + nftables mark for app-based rules */
+                if (r.app_path[0] && r.action != PF_ACTION_DIRECT) {
+                    pf_cgroup_create_rule(new_id);
+                    pf_nft_add_cgroup_mark(new_id);
+                    pf_log_info("rule.add: cgroup+nft mark set up for rule_%d (app=%s)",
+                                new_id, r.app_path);
+                }
+
                 /* reload ruleset */
                 pf_rules_load(ctx->ruleset, &ctx->config);
                 cJSON_AddStringToObject(resp, "result", "ok");
@@ -442,6 +563,11 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             cJSON_AddStringToObject(resp, "error", "missing id");
         } else {
             int id = (int)id_v->valuedouble;
+
+            /* Clean up cgroup + nft mark before deleting */
+            pf_cgroup_remove_rule(id);
+            pf_nft_remove_cgroup_mark(id);
+
             if (pf_config_rule_delete(&ctx->config, id) == PF_OK) {
                 pf_rules_load(ctx->ruleset, &ctx->config);
                 cJSON_AddStringToObject(resp, "result", "ok");
@@ -851,8 +977,13 @@ int main(int argc, char *argv[])
                     "(requires root and IP_TRANSPARENT)");
         ctx->tproxy.listen_fd = -1;
     } else {
-        pf_log_info("TPROXY listening on port %d", PF_TPROXY_PORT);
+        /* Wire up the proxy connect callback so TPROXY can route through proxies */
+        pf_tproxy_set_connect_cb(&ctx->tproxy, proxy_connect_for_tproxy, ctx);
+        pf_log_info("TPROXY listening on port %d (proxy routing active)", PF_TPROXY_PORT);
     }
+
+    /* 5k-bis. Restore cgroup + nft marks for all existing app-based rules */
+    setup_cgroups_for_existing_rules(ctx);
 
     /* 5l. Process monitor (netlink) — optional, requires root */
     if (pf_monitor_init(&ctx->monitor, on_process_event, ctx) != PF_OK) {
@@ -930,7 +1061,14 @@ int main(int argc, char *argv[])
 
                 /* ── TPROXY: new connection ────────────────────────────── */
                 if (ctx->tproxy.listen_fd > 0 && fd == ctx->tproxy.listen_fd) {
-                    pf_tproxy_accept(&ctx->tproxy);
+                    int slot = pf_tproxy_accept(&ctx->tproxy);
+                    if (slot >= 0 && ctx->tproxy.conns[slot].active) {
+                        /* Register both fds in main epoll for relay */
+                        epoll_add(ctx->epoll_fd,
+                                  ctx->tproxy.conns[slot].client_fd, EPOLLIN);
+                        epoll_add(ctx->epoll_fd,
+                                  ctx->tproxy.conns[slot].proxy_fd,  EPOLLIN);
+                    }
                     continue;
                 }
 

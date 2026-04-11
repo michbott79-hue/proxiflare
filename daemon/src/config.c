@@ -743,3 +743,13 @@ int pf_config_set(pf_config_t *cfg, const char *key, const char *value)
     sqlite3_finalize(st);
     return rc;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_config_last_id — return the rowid of the last INSERT
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_config_last_id(pf_config_t *cfg)
+{
+    if (!cfg || !cfg->db) return 0;
+    return (int)sqlite3_last_insert_rowid(cfg->db);
+}

@@ -180,7 +180,7 @@ export default function Proxies() {
               <div className="mb-3 flex items-center gap-2 text-sm text-[#64748b]">
                 <span className={`inline-block h-2 w-2 rounded-full ${HEALTH_DOT[proxy.health]}`} />
                 <span className="capitalize">{proxy.health}</span>
-                {proxy.latency_ms !== null && (
+                {proxy.latency_ms !== null && proxy.latency_ms > 0 && proxy.latency_ms < 100000 && (
                   <span className="ml-auto">{proxy.latency_ms}ms</span>
                 )}
               </div>

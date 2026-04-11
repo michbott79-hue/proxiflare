@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -1493,9 +1494,26 @@ int main(int argc, char *argv[])
                         pf_connection_t *c = &ctx->tproxy.conns[slot];
 
                         /* MITM TLS interception: if enabled and connection is TLS,
-                         * wrap both sides in SSL for decrypted inspection */
+                         * wrap both sides in SSL for decrypted inspection.
+                         * SSL handshakes require BLOCKING fds — temporarily switch,
+                         * then back to non-blocking for epoll relay. */
                         if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
-                            /* Make fds blocking for SSL handshake */
+                            /* Set blocking for SSL handshake */
+                            {
+                                int fl;
+                                fl = fcntl(c->proxy_fd, F_GETFL, 0);
+                                fcntl(c->proxy_fd, F_SETFL, fl & ~O_NONBLOCK);
+                                fl = fcntl(c->client_fd, F_GETFL, 0);
+                                fcntl(c->client_fd, F_SETFL, fl & ~O_NONBLOCK);
+                            }
+
+                            /* Set timeout for SSL handshake (5s) */
+                            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                            setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                            setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                            setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                            setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
                             c->server_ssl = pf_mitm_wrap_server(&ctx->mitm, c->proxy_fd, c->domain);
                             if (c->server_ssl) {
                                 c->client_ssl = pf_mitm_wrap_client(&ctx->mitm, c->client_fd, c->domain);
@@ -1510,6 +1528,20 @@ int main(int argc, char *argv[])
                                 }
                             } else {
                                 pf_log_warn("mitm: server TLS wrap failed for %s", c->domain);
+                            }
+
+                            /* Restore non-blocking + clear timeout */
+                            {
+                                int fl;
+                                struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
+                                fl = fcntl(c->proxy_fd, F_GETFL, 0);
+                                fcntl(c->proxy_fd, F_SETFL, fl | O_NONBLOCK);
+                                fl = fcntl(c->client_fd, F_GETFL, 0);
+                                fcntl(c->client_fd, F_SETFL, fl | O_NONBLOCK);
+                                setsockopt(c->proxy_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+                                setsockopt(c->proxy_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
+                                setsockopt(c->client_fd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+                                setsockopt(c->client_fd, SOL_SOCKET, SO_SNDTIMEO, &notv, sizeof(notv));
                             }
                         }
                         /* For non-TLS HTTP with inspect enabled, also set inspect flag */

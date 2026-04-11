@@ -195,11 +195,30 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
     char    domain[PF_DOMAIN_MAX] = {0};
 
     bool is_tls = false;
-    ssize_t n = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT);
+
+    /* Wait briefly for ClientHello data — MSG_DONTWAIT may miss it if
+     * the kernel hasn't queued the data yet. Use a short blocking peek. */
+    {
+        struct timeval peek_tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &peek_tv, sizeof(peek_tv));
+    }
+    ssize_t n = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK);
+    {
+        struct timeval notv = { .tv_sec = 0, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &notv, sizeof(notv));
+    }
+
     if (n > 0 && peek_buf[0] == 0x16) {
         /* Looks like TLS — try to extract SNI */
         pf_sni_extract(peek_buf, (size_t)n, domain, sizeof(domain));
         is_tls = true;
+        pf_log_info("tproxy: TLS detected, SNI=%s (peeked %zd bytes)",
+                     domain[0] ? domain : "(none)", n);
+    } else if (n > 0) {
+        pf_log_info("tproxy: non-TLS data detected (first byte=0x%02X, %zd bytes)",
+                     peek_buf[0], n);
+    } else {
+        pf_log_info("tproxy: peek returned %zd (no data yet)", n);
     }
 
     /* ── Connect through proxy via callback ─────────────────────────────── */

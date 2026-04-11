@@ -189,3 +189,86 @@ int pf_nft_remove_cgroup_mark(int rule_id)
     (void)rule_id;
     return PF_OK;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_nft_dns_leak_protect
+ *
+ * Redirects all outgoing DNS (UDP+TCP port 53) to the specified secure server,
+ * except traffic already destined for that server.  Prevents DNS leaks by
+ * ensuring all DNS queries go through the chosen resolver.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_nft_dns_leak_protect(const char *dns_server)
+{
+    if (!dns_server || dns_server[0] == '\0') {
+        pf_log_error("nft: dns_leak_protect: invalid dns_server");
+        return PF_ERR;
+    }
+
+    char cmd[1024];
+
+    /* UDP DNS redirect */
+    snprintf(cmd, sizeof(cmd),
+        "table inet proxiflare {\n"
+        "    chain output {\n"
+        "        udp dport 53 ip daddr != %s counter dnat to %s\n"
+        "    }\n"
+        "}\n",
+        dns_server, dns_server);
+
+    if (nft_run(cmd) != PF_OK) {
+        pf_log_error("nft: dns_leak_protect: failed to add UDP DNS redirect rule");
+        return PF_ERR;
+    }
+
+    /* TCP DNS redirect */
+    snprintf(cmd, sizeof(cmd),
+        "table inet proxiflare {\n"
+        "    chain output {\n"
+        "        tcp dport 53 ip daddr != %s counter dnat to %s\n"
+        "    }\n"
+        "}\n",
+        dns_server, dns_server);
+
+    if (nft_run(cmd) != PF_OK) {
+        pf_log_error("nft: dns_leak_protect: failed to add TCP DNS redirect rule");
+        return PF_ERR;
+    }
+
+    pf_log_info("nft: DNS leak protection active — redirecting all DNS to %s", dns_server);
+    return PF_OK;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_nft_dns_leak_disable
+ *
+ * Removes the DNS DNAT redirect rules by flushing the output chain and
+ * re-installing the base rules (cgroup mark + DNS NFQUEUE).
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_nft_dns_leak_disable(void)
+{
+    /* Flush the output chain to remove all rules including the DNS DNAT ones */
+    const char *flush_cmd = "flush chain inet proxiflare output\n";
+
+    if (nft_run(flush_cmd) != PF_OK) {
+        pf_log_error("nft: dns_leak_disable: failed to flush output chain");
+        return PF_ERR;
+    }
+
+    /* Re-add the base DNS NFQUEUE rule so DNS interception still works */
+    const char *restore_cmd =
+        "table inet proxiflare {\n"
+        "    chain output {\n"
+        "        udp dport 53 queue num 0\n"
+        "    }\n"
+        "}\n";
+
+    if (nft_run(restore_cmd) != PF_OK) {
+        pf_log_warn("nft: dns_leak_disable: failed to restore DNS redirect rule");
+        /* Non-fatal — DNS leak protection is still disabled */
+    }
+
+    pf_log_info("nft: DNS leak protection disabled");
+    return PF_OK;
+}

@@ -142,6 +142,21 @@ export async function systemVersion(): Promise<string> {
   return invoke<string>('system_version');
 }
 
+// ── DNS leak protection ─────────────────────────────────────────
+
+export async function dnsLeakEnable(dnsServer: string): Promise<void> {
+  return invoke<void>('dns_leak_enable', { dnsServer });
+}
+
+export async function dnsLeakDisable(): Promise<void> {
+  return invoke<void>('dns_leak_disable');
+}
+
+export async function dnsLeakStatus(): Promise<{ enabled: boolean; dns_server: string }> {
+  const raw = await invoke<any>('dns_leak_status');
+  return raw?.result ?? raw ?? { enabled: false, dns_server: '1.1.1.1' };
+}
+
 // ── System apps ─────────────────────────────────────────────────
 
 export interface SystemApp {

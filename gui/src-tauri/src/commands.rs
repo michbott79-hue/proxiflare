@@ -233,6 +233,23 @@ pub fn system_version(client: State<DaemonClient>) -> Result<Value, String> {
     client.send_request("system.version", json!({}))
 }
 
+// ── DNS leak protection ──────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn dns_leak_enable(client: State<DaemonClient>, dns_server: String) -> Result<Value, String> {
+    client.send_request("dns_leak.enable", json!({ "dns_server": dns_server }))
+}
+
+#[tauri::command]
+pub fn dns_leak_disable(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("dns_leak.disable", json!({}))
+}
+
+#[tauri::command]
+pub fn dns_leak_status(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("dns_leak.status", json!({}))
+}
+
 // ── System apps ─────────────────────────────────────────────────────────────
 
 #[tauri::command]

@@ -35,6 +35,9 @@ fn main() {
             commands::credentials_lock,
             commands::system_status,
             commands::system_version,
+            commands::dns_leak_enable,
+            commands::dns_leak_disable,
+            commands::dns_leak_status,
             commands::list_system_apps,
         ])
         .on_window_event(|window, event| {

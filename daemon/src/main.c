@@ -576,6 +576,10 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
 
     /* ── system.status ───────────────────────────────────────────────────── */
     } else if (strcmp(method, "system.status") == 0) {
+        char dns_leak_enabled[8] = "false";
+        char dns_server_val[64]  = "1.1.1.1";
+        pf_config_get(&ctx->config, "dns_leak_enabled", dns_leak_enabled, (int)sizeof(dns_leak_enabled));
+        pf_config_get(&ctx->config, "dns_server",       dns_server_val,   (int)sizeof(dns_server_val));
         cJSON *r = cJSON_CreateObject();
         cJSON_AddBoolToObject  (r, "running",    ctx->running ? true : false);
         cJSON_AddStringToObject(r, "version",    PF_VERSION);
@@ -583,11 +587,43 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         cJSON_AddBoolToObject  (r, "crypto_unlocked", ctx->crypto.unlocked);
         cJSON_AddBoolToObject  (r, "dns_active",  ctx->dns.fd > 0);
         cJSON_AddBoolToObject  (r, "tproxy_active", ctx->tproxy.listen_fd > 0);
+        cJSON_AddBoolToObject  (r, "dns_leak_enabled", strcmp(dns_leak_enabled, "true") == 0);
+        cJSON_AddStringToObject(r, "dns_server",       dns_server_val);
         cJSON_AddItemToObject  (resp, "result", r);
 
     /* ── system.version ──────────────────────────────────────────────────── */
     } else if (strcmp(method, "system.version") == 0) {
         cJSON_AddStringToObject(resp, "result", PF_VERSION);
+
+    /* ── dns_leak.enable ────────────────────────────────────────────────── */
+    } else if (strcmp(method, "dns_leak.enable") == 0) {
+        cJSON *server_v = params ? cJSON_GetObjectItem(params, "dns_server") : NULL;
+        const char *dns = (server_v && server_v->valuestring && server_v->valuestring[0])
+                          ? server_v->valuestring : "1.1.1.1";
+        if (pf_nft_dns_leak_protect(dns) == PF_OK) {
+            pf_config_set(&ctx->config, "dns_leak_enabled", "true");
+            pf_config_set(&ctx->config, "dns_server", dns);
+            cJSON_AddStringToObject(resp, "result", "ok");
+        } else {
+            cJSON_AddStringToObject(resp, "error", "failed to set DNS rules");
+        }
+
+    /* ── dns_leak.disable ───────────────────────────────────────────────── */
+    } else if (strcmp(method, "dns_leak.disable") == 0) {
+        pf_nft_dns_leak_disable();
+        pf_config_set(&ctx->config, "dns_leak_enabled", "false");
+        cJSON_AddStringToObject(resp, "result", "ok");
+
+    /* ── dns_leak.status ────────────────────────────────────────────────── */
+    } else if (strcmp(method, "dns_leak.status") == 0) {
+        char enabled[8]  = "false";
+        char server[64]  = "1.1.1.1";
+        pf_config_get(&ctx->config, "dns_leak_enabled", enabled, (int)sizeof(enabled));
+        pf_config_get(&ctx->config, "dns_server",       server,  (int)sizeof(server));
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject  (r, "enabled",    strcmp(enabled, "true") == 0);
+        cJSON_AddStringToObject(r, "dns_server", server);
+        cJSON_AddItemToObject  (resp, "result", r);
 
     /* ── unknown ─────────────────────────────────────────────────────────── */
     } else {
@@ -784,6 +820,20 @@ int main(int argc, char *argv[])
         if (pf_nft_setup_tproxy(PF_TPROXY_PORT) != PF_OK)
             pf_log_warn("nft_setup_tproxy failed");
         pf_log_info("nftables rules installed");
+
+        /* Restore DNS leak protection if it was active before daemon restart */
+        {
+            char dns_leak[8]    = "false";
+            char dns_server[64] = "1.1.1.1";
+            pf_config_get(&ctx->config, "dns_leak_enabled", dns_leak, (int)sizeof(dns_leak));
+            if (strcmp(dns_leak, "true") == 0) {
+                pf_config_get(&ctx->config, "dns_server", dns_server, (int)sizeof(dns_server));
+                if (pf_nft_dns_leak_protect(dns_server) == PF_OK)
+                    pf_log_info("DNS leak protection restored (server: %s)", dns_server);
+                else
+                    pf_log_warn("DNS leak protection restore failed");
+            }
+        }
     }
 
     /* 5j. cgroups — optional, requires root */

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { DaemonStatus } from '../lib/types';
 import * as api from '../lib/api';
 
@@ -15,6 +15,14 @@ interface Props {
   daemon: DaemonState;
 }
 
+const DNS_PRESETS = [
+  { label: 'Cloudflare',  value: '1.1.1.1' },
+  { label: 'Google',      value: '8.8.8.8' },
+  { label: 'Quad9',       value: '9.9.9.9' },
+  { label: 'OpenDNS',     value: '208.67.222.222' },
+  { label: 'Custom',      value: 'custom' },
+];
+
 export default function Settings({ daemon }: Props) {
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -22,6 +30,76 @@ export default function Settings({ daemon }: Props) {
   const [passwordMsg, setPasswordMsg] = useState('');
   const [passwordError, setPasswordError] = useState(false);
   const [locking, setLocking] = useState(false);
+
+  /* DNS leak protection state */
+  const [dnsEnabled, setDnsEnabled]       = useState(false);
+  const [dnsServer, setDnsServer]         = useState('1.1.1.1');
+  const [dnsCustom, setDnsCustom]         = useState('');
+  const [dnsDropOpen, setDnsDropOpen]     = useState(false);
+  const [dnsToggling, setDnsToggling]     = useState(false);
+  const dnsDropRef                        = useRef<HTMLDivElement>(null);
+
+  /* Derive selected preset label */
+  const selectedPreset = DNS_PRESETS.find(p => p.value === dnsServer) ?? DNS_PRESETS[4];
+  const effectiveDns   = dnsServer === 'custom' ? dnsCustom : dnsServer;
+
+  useEffect(() => {
+    if (!daemon.connected) return;
+    api.dnsLeakStatus()
+      .then(s => {
+        setDnsEnabled(s.enabled);
+        const preset = DNS_PRESETS.find(p => p.value === s.dns_server);
+        if (preset) {
+          setDnsServer(s.dns_server);
+        } else if (s.dns_server) {
+          setDnsServer('custom');
+          setDnsCustom(s.dns_server);
+        }
+      })
+      .catch(() => {/* daemon may not support it yet */});
+  }, [daemon.connected]);
+
+  /* Close dropdown on outside click */
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (dnsDropRef.current && !dnsDropRef.current.contains(e.target as Node)) {
+        setDnsDropOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  async function handleDnsToggle() {
+    setDnsToggling(true);
+    try {
+      if (dnsEnabled) {
+        await api.dnsLeakDisable();
+        setDnsEnabled(false);
+      } else {
+        await api.dnsLeakEnable(effectiveDns);
+        setDnsEnabled(true);
+      }
+    } catch (e) {
+      console.error('DNS leak toggle error:', e);
+    } finally {
+      setDnsToggling(false);
+    }
+  }
+
+  async function handleDnsServerChange(value: string) {
+    setDnsServer(value);
+    setDnsDropOpen(false);
+    if (value === 'custom') return;
+    /* If already enabled, update the active server immediately */
+    if (dnsEnabled) {
+      try {
+        await api.dnsLeakEnable(value);
+      } catch (e) {
+        console.error('DNS server update error:', e);
+      }
+    }
+  }
 
   async function handleChangePassword(e: React.FormEvent) {
     e.preventDefault();
@@ -169,6 +247,96 @@ export default function Settings({ daemon }: Props) {
           >
             {locking ? 'Locking...' : 'Lock Vault'}
           </button>
+        </div>
+      </section>
+
+      {/* DNS Leak Protection section */}
+      <section className="rounded-lg border border-[#2d3348] bg-[#1a1d27] p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-[#64748b]">DNS Leak Protection</h2>
+          {dnsEnabled && (
+            <span className="flex items-center gap-1.5 text-xs text-[#22c55e]">
+              <span className="inline-block h-2 w-2 rounded-full bg-[#22c55e]" />
+              Active
+            </span>
+          )}
+        </div>
+        <p className="mb-4 text-xs text-[#64748b]">
+          Prevents DNS queries from leaking to your ISP. All DNS is redirected to a secure server.
+        </p>
+        <div className="space-y-4">
+          {/* Toggle */}
+          <div className="flex items-center justify-between">
+            <span className="text-sm">Enable protection</span>
+            <button
+              onClick={handleDnsToggle}
+              disabled={dnsToggling}
+              className={`relative h-5 w-9 rounded-full transition-colors disabled:opacity-50 ${
+                dnsEnabled ? 'bg-[#6366f1]' : 'bg-[#2d3348]'
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                  dnsEnabled ? 'left-[calc(100%-1.125rem)]' : 'left-0.5'
+                }`}
+              />
+            </button>
+          </div>
+
+          {/* DNS Server selector */}
+          <div className="flex items-center justify-between">
+            <span className="text-sm">DNS Server</span>
+            <div className="relative" ref={dnsDropRef}>
+              <button
+                onClick={() => setDnsDropOpen(v => !v)}
+                className="flex items-center gap-2 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-sm text-[#e2e8f0] transition-colors hover:border-[#6366f1]"
+              >
+                <span>{selectedPreset.label}</span>
+                <svg className="h-3 w-3 text-[#64748b]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+              {dnsDropOpen && (
+                <div className="absolute right-0 z-50 mt-1 min-w-[180px] rounded-md border border-[#2d3348] bg-[#1a1d27] py-1 shadow-lg">
+                  {DNS_PRESETS.map(preset => (
+                    <button
+                      key={preset.value}
+                      onClick={() => handleDnsServerChange(preset.value)}
+                      className={`flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-[#2d3348] ${
+                        dnsServer === preset.value ? 'text-[#6366f1]' : 'text-[#e2e8f0]'
+                      }`}
+                    >
+                      <span>{preset.label}</span>
+                      {preset.value !== 'custom' && (
+                        <span className="text-xs text-[#64748b]">{preset.value}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Custom DNS input */}
+          {dnsServer === 'custom' && (
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                value={dnsCustom}
+                onChange={e => setDnsCustom(e.target.value)}
+                placeholder="e.g. 94.140.14.14"
+                className="flex-1 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+              />
+              {dnsEnabled && (
+                <button
+                  onClick={() => api.dnsLeakEnable(dnsCustom).catch(console.error)}
+                  className="rounded-md bg-[#6366f1] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#818cf8]"
+                >
+                  Apply
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </section>
 

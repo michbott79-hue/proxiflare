@@ -4,10 +4,11 @@ mod commands;
 mod ipc;
 
 use ipc::DaemonClient;
+use serde_json::json;
+use tauri::Manager;
 
 fn main() {
     let client = DaemonClient::new();
-    // Try to connect at startup — GUI can work offline and retry per-request
     let _ = client.connect();
 
     tauri::Builder::default()
@@ -35,6 +36,15 @@ fn main() {
             commands::system_status,
             commands::system_version,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                // Send shutdown to daemon — cleans up nftables, cgroups, proxy routes
+                let app = window.app_handle();
+                if let Some(client) = app.try_state::<DaemonClient>() {
+                    let _ = client.send_request("system.shutdown", json!({}));
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error running ProxiFlare");
 }

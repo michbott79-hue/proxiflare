@@ -753,3 +753,57 @@ int pf_config_last_id(pf_config_t *cfg)
     if (!cfg || !cfg->db) return 0;
     return (int)sqlite3_last_insert_rowid(cfg->db);
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Reference counting — check how many objects reference a proxy/chain
+ * Returns total reference count, or -1 on error.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_config_proxy_ref_count(pf_config_t *cfg, int proxy_id)
+{
+    if (!cfg || !cfg->db) return -1;
+
+    int total = 0;
+    sqlite3_stmt *st = NULL;
+
+    /* Count rules referencing this proxy */
+    if (sqlite3_prepare_v2(cfg->db,
+            "SELECT COUNT(*) FROM rules WHERE proxy_id=?;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, proxy_id);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            total += sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+
+    /* Count chain_hops referencing this proxy */
+    if (sqlite3_prepare_v2(cfg->db,
+            "SELECT COUNT(*) FROM chain_hops WHERE proxy_id=?;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, proxy_id);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            total += sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+
+    return total;
+}
+
+int pf_config_chain_ref_count(pf_config_t *cfg, int chain_id)
+{
+    if (!cfg || !cfg->db) return -1;
+
+    sqlite3_stmt *st = NULL;
+    int count = 0;
+
+    if (sqlite3_prepare_v2(cfg->db,
+            "SELECT COUNT(*) FROM rules WHERE chain_id=?;",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, chain_id);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            count = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+
+    return count;
+}

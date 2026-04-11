@@ -333,9 +333,15 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     if (!ctx || !ctx->ruleset) return -1;
 
     /* Traffic arrives at TPROXY because nftables cgroup match marked it.
-     * This means a rule with action=PROXY and a cgroup is responsible.
-     * Strategy: try domain-based match first, then fall back to finding
-     * ANY active PROXY rule with an app_path (those are the ones with cgroups). */
+     * This means a process in a proxiflare cgroup initiated this connection.
+     * Strategy:
+     *   1. Resolve domain from SNI or DNS cache
+     *   2. Try domain-only rules (no app constraint) first
+     *   3. If no match, iterate ALL app-based PROXY rules and find the best:
+     *      - "specific" rules (have domain/ip/port constraints that match) win
+     *      - "catch-all" rules (app-only, no domain/ip/port) are fallback
+     *      This handles the multi-rule scenario: e.g. "Firefox IT" (catch-all)
+     *      + "SKY.IT via CH" (domain-specific) — SKY domains use CH proxy. */
     const char *match_domain = (domain && domain[0]) ? domain : NULL;
 
     if (!match_domain && dst_ip && dst_ip[0]) {
@@ -344,21 +350,46 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
             match_domain = dns_entry->domain;
     }
 
-    /* First try: match by domain/IP (for domain-based rules) */
+    /* First try: match by domain/IP only (for rules without app constraint) */
     const pf_rule_t *rule = pf_rules_match(ctx->ruleset, NULL, match_domain,
                                            dst_ip, dst_port);
 
-    /* If no match or DIRECT, try finding the app-based PROXY rule that sent
-     * this traffic here (it's marked because the process is in a cgroup) */
+    /* If no match or DIRECT, scan all app-based PROXY rules.
+     * Since we don't know which app sent this (TPROXY lost PID info),
+     * we check domain/ip/port criteria to find the most specific match. */
     if (!rule || rule->action == PF_ACTION_DIRECT) {
+        const pf_rule_t *best_specific = NULL;
+        const pf_rule_t *best_catchall = NULL;
+
         for (int i = 0; i < ctx->ruleset->count; i++) {
             const pf_rule_t *r = &ctx->ruleset->rules[i];
-            if (r->enabled && r->action == PF_ACTION_PROXY &&
-                r->app_path[0] && r->proxy_id > 0) {
-                rule = r;
-                break;
+            if (!r->enabled || r->action != PF_ACTION_PROXY ||
+                !r->app_path[0] || r->proxy_id == 0)
+                continue;
+
+            /* Check optional domain/ip/port criteria (empty = don't care) */
+            bool domain_ok = (r->domain[0] == '\0') ||
+                             (match_domain && pf_match_domain(r->domain, match_domain));
+            bool ip_ok     = (r->ip_cidr[0] == '\0') ||
+                             (dst_ip && pf_match_ip(r->ip_cidr, dst_ip));
+            bool port_ok   = (r->dst_port == 0) ||
+                             (dst_port == (int)r->dst_port);
+
+            if (!domain_ok || !ip_ok || !port_ok) continue;
+
+            /* Specific rule: has at least one domain/ip/port constraint */
+            bool has_specifics = (r->domain[0] || r->ip_cidr[0] || r->dst_port != 0);
+
+            if (has_specifics) {
+                if (!best_specific) best_specific = r;
+                /* first specific match wins (rules sorted by priority ASC) */
+            } else {
+                if (!best_catchall) best_catchall = r;
             }
         }
+
+        /* Prefer specific match over catch-all */
+        rule = best_specific ? best_specific : best_catchall;
     }
 
     if (!rule || rule->action == PF_ACTION_DIRECT)
@@ -562,10 +593,18 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             cJSON_AddStringToObject(resp, "error", "missing id");
         } else {
             int id = (int)id_v->valuedouble;
-            if (pf_config_proxy_delete(&ctx->config, id) == PF_OK)
+            int refs = pf_config_proxy_ref_count(&ctx->config, id);
+            if (refs > 0) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "Proxy is still used by %d rule(s)/chain(s). "
+                         "Remove references first.", refs);
+                cJSON_AddStringToObject(resp, "error", msg);
+            } else if (pf_config_proxy_delete(&ctx->config, id) == PF_OK) {
                 cJSON_AddStringToObject(resp, "result", "ok");
-            else
+            } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
+            }
         }
 
     /* ── proxy.test ──────────────────────────────────────────────────────── */
@@ -723,10 +762,18 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             cJSON_AddStringToObject(resp, "error", "missing id");
         } else {
             int id = (int)id_v->valuedouble;
-            if (pf_config_chain_delete(&ctx->config, id) == PF_OK)
+            int refs = pf_config_chain_ref_count(&ctx->config, id);
+            if (refs > 0) {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "Chain is still used by %d rule(s). "
+                         "Remove references first.", refs);
+                cJSON_AddStringToObject(resp, "error", msg);
+            } else if (pf_config_chain_delete(&ctx->config, id) == PF_OK) {
                 cJSON_AddStringToObject(resp, "result", "ok");
-            else
+            } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
+            }
         }
 
     /* ── config.get ──────────────────────────────────────────────────────── */
@@ -808,10 +855,33 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         char dns_server_val[64]  = "1.1.1.1";
         pf_config_get(&ctx->config, "dns_leak_enabled", dns_leak_enabled, (int)sizeof(dns_leak_enabled));
         pf_config_get(&ctx->config, "dns_server",       dns_server_val,   (int)sizeof(dns_server_val));
+
+        /* Count proxies online and rules active */
+        int proxies_online = 0;
+        {
+            pf_proxy_t pbuf[PF_MAX_PROXIES];
+            int pcount = 0;
+            if (pf_config_proxy_list(&ctx->config, pbuf, PF_MAX_PROXIES, &pcount) == PF_OK) {
+                for (int pi = 0; pi < pcount; pi++) {
+                    if (pbuf[pi].enabled && pbuf[pi].health == PF_HEALTH_ONLINE)
+                        proxies_online++;
+                }
+            }
+        }
+        int rules_active = ctx->ruleset ? 0 : 0;
+        if (ctx->ruleset) {
+            for (int ri = 0; ri < ctx->ruleset->count; ri++) {
+                if (ctx->ruleset->rules[ri].enabled)
+                    rules_active++;
+            }
+        }
+
         cJSON *r = cJSON_CreateObject();
         cJSON_AddBoolToObject  (r, "running",    ctx->running ? true : false);
         cJSON_AddStringToObject(r, "version",    PF_VERSION);
         cJSON_AddNumberToObject(r, "connections", ctx->tproxy.conn_count);
+        cJSON_AddNumberToObject(r, "proxies_online", proxies_online);
+        cJSON_AddNumberToObject(r, "rules_active",   rules_active);
         cJSON_AddBoolToObject  (r, "crypto_unlocked", ctx->crypto.unlocked);
         cJSON_AddBoolToObject  (r, "dns_active",  ctx->dns.fd > 0);
         cJSON_AddBoolToObject  (r, "tproxy_active", ctx->tproxy.listen_fd > 0);

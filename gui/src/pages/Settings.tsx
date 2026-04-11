@@ -31,6 +31,10 @@ export default function Settings({ daemon }: Props) {
   const [passwordError, setPasswordError] = useState(false);
   const [locking, setLocking] = useState(false);
 
+  /* Boot at startup state */
+  const [bootEnabled, setBootEnabled]     = useState(false);
+  const [bootToggling, setBootToggling]   = useState(false);
+
   /* DNS leak protection state */
   const [dnsEnabled, setDnsEnabled]       = useState(false);
   const [dnsServer, setDnsServer]         = useState('1.1.1.1');
@@ -56,7 +60,10 @@ export default function Settings({ daemon }: Props) {
           setDnsCustom(s.dns_server);
         }
       })
-      .catch(() => {/* daemon may not support it yet */});
+      .catch(() => {});
+    api.configGet('boot_enabled')
+      .then(v => setBootEnabled(v === 'true' || v === '1'))
+      .catch(() => {});
   }, [daemon.connected]);
 
   /* Close dropdown on outside click */
@@ -185,10 +192,23 @@ export default function Settings({ daemon }: Props) {
           <div className="flex items-center justify-between">
             <span className="text-sm">Start at boot</span>
             <button
-              className="relative h-5 w-9 rounded-full bg-[#2d3348] transition-colors"
-              title="Not yet implemented"
+              onClick={async () => {
+                setBootToggling(true);
+                try {
+                  const next = !bootEnabled;
+                  await api.configSet('boot_enabled', next ? 'true' : 'false');
+                  setBootEnabled(next);
+                } catch (e) { console.error('Boot toggle error:', e); }
+                finally { setBootToggling(false); }
+              }}
+              disabled={bootToggling}
+              className={`relative h-5 w-9 rounded-full transition-colors disabled:opacity-50 ${
+                bootEnabled ? 'bg-[#6366f1]' : 'bg-[#2d3348]'
+              }`}
             >
-              <span className="absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white" />
+              <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                bootEnabled ? 'left-[calc(100%-1.125rem)]' : 'left-0.5'
+              }`} />
             </button>
           </div>
         </div>
@@ -367,7 +387,7 @@ export default function Settings({ daemon }: Props) {
           <div className="flex items-center justify-between">
             <span className="text-sm">Version</span>
             <span className="text-sm text-[#64748b]">
-              {daemon.status?.version || 'ProxiFlare v1.0.0'}
+              {daemon.status?.version || '0.1.0-alpha'}
             </span>
           </div>
         </div>

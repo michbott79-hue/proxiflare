@@ -42,4 +42,8 @@ int pf_config_set(pf_config_t *cfg, const char *key, const char *value);
 /* Last inserted row ID (wraps sqlite3_last_insert_rowid) */
 int pf_config_last_id(pf_config_t *cfg);
 
+/* Reference counting — returns count of references, or -1 on error */
+int pf_config_proxy_ref_count(pf_config_t *cfg, int proxy_id);
+int pf_config_chain_ref_count(pf_config_t *cfg, int chain_id);
+
 #endif /* PF_CONFIG_H */

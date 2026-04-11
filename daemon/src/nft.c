@@ -36,6 +36,67 @@ static int run_cmd(const char *cmd)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * nft_delete_by_comment — remove all rules in a chain whose comment contains
+ * the given substring.  Works by listing rules with handles (-a), parsing
+ * for the comment and handle, then deleting by handle.
+ *
+ * table_type: "inet" or "ip"
+ * table:      "proxiflare" or "proxiflare_tproxy"
+ * chain:      "output" or "prerouting"
+ * comment:    substring to match in comment field (e.g. "pf_dns_leak")
+ * ───────────────────────────────────────────────────────────────────────────── */
+static int nft_delete_by_comment(const char *table_type, const char *table,
+                                  const char *chain, const char *comment)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "nft -a list chain %s %s %s 2>/dev/null",
+             table_type, table, chain);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return PF_ERR;
+
+    char line[1024];
+    int deleted = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* Look for lines containing our comment marker */
+        if (!strstr(line, comment)) continue;
+
+        /* Extract handle: lines end with "# handle N" */
+        const char *hstr = strstr(line, "# handle ");
+        if (!hstr) continue;
+
+        int handle = atoi(hstr + 9);
+        if (handle <= 0) continue;
+
+        /* Queue up the delete — we'll run it after closing this popen */
+        char del[256];
+        snprintf(del, sizeof(del),
+                 "delete rule %s %s %s handle %d\n",
+                 table_type, table, chain, handle);
+        /* Can't nest popen, so store and delete below */
+        /* For simplicity: close this fp, delete, re-open */
+        /* Actually, collect handles first, delete after */
+        pclose(fp);
+
+        nft_run(del);
+        deleted++;
+
+        /* Re-open and restart scan (handles may have shifted) */
+        fp = popen(cmd, "r");
+        if (!fp) return deleted > 0 ? PF_OK : PF_ERR;
+    }
+
+    pclose(fp);
+
+    if (deleted > 0)
+        pf_log_info("nft: deleted %d rules with comment '%s' from %s %s %s",
+                     deleted, comment, table_type, table, chain);
+
+    return PF_OK;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * pf_nft_init — Create tables and policy routing for TPROXY
  *
  * Two tables:
@@ -53,11 +114,18 @@ int pf_nft_init(void)
     nft_run("delete table inet proxiflare\n");
     nft_run("delete table ip proxiflare_tproxy\n");
 
-    /* Main table: inet (output chain for DNS + cgroup marking) */
+    /* Main table: inet
+     * Two output chains:
+     *   - output: type route for cgroup marking + DNS NFQUEUE
+     *   - output_nat: type nat for DNS DNAT (leak protection)
+     * DNAT only works in nat chains, not route chains. */
     const char *main_table =
         "table inet proxiflare {\n"
         "    chain output {\n"
         "        type route hook output priority 0; policy accept;\n"
+        "    }\n"
+        "    chain output_nat {\n"
+        "        type nat hook output priority 0; policy accept;\n"
         "    }\n"
         "}\n";
 
@@ -111,7 +179,7 @@ int pf_nft_cleanup(void)
 
 int pf_nft_setup_dns_redirect(void)
 {
-    if (nft_run("add rule inet proxiflare output udp dport 53 queue num 0\n") != PF_OK) {
+    if (nft_run("add rule inet proxiflare output udp dport 53 queue num 0 comment \"pf_dns_nfqueue\"\n") != PF_OK) {
         pf_log_error("nft: failed to add DNS NFQUEUE rule");
         return PF_ERR;
     }
@@ -153,12 +221,13 @@ int pf_nft_add_cgroup_mark(int rule_id)
 
     /* Use cgroupv2 socket matching — this is the correct nftables syntax
      * for matching processes in a specific cgroup hierarchy node.
-     * "level 2" means 2 levels deep in the hierarchy: proxiflare/rule_N */
+     * "level 2" means 2 levels deep in the hierarchy: proxiflare/rule_N
+     * Comment tag enables targeted removal without flushing the chain. */
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "add rule inet proxiflare output socket cgroupv2 level 2 "
-        "\"proxiflare/rule_%d\" meta mark set 1\n",
-        rule_id);
+        "\"proxiflare/rule_%d\" meta mark set 1 comment \"pf_cgroup_%d\"\n",
+        rule_id, rule_id);
 
     if (nft_run(cmd) != PF_OK) {
         pf_log_error("nft: failed to add cgroup mark for rule_%d", rule_id);
@@ -174,9 +243,12 @@ int pf_nft_add_cgroup_mark(int rule_id)
 
 int pf_nft_remove_cgroup_mark(int rule_id)
 {
-    pf_log_info("nft: cgroup mark for rule_%d flagged for removal (requires reload)", rule_id);
-    (void)rule_id;
-    return PF_OK;
+    char comment[64];
+    snprintf(comment, sizeof(comment), "pf_cgroup_%d", rule_id);
+    int rc = nft_delete_by_comment("inet", "proxiflare", "output", comment);
+    if (rc == PF_OK)
+        pf_log_info("nft: cgroup mark rule removed for rule_%d", rule_id);
+    return rc;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -190,11 +262,15 @@ int pf_nft_dns_leak_protect(const char *dns_server)
         return PF_ERR;
     }
 
+    /* Remove any existing DNS DNAT rules first (prevents duplicates on server change) */
+    nft_delete_by_comment("inet", "proxiflare", "output_nat", "pf_dns_leak");
+
     char cmd[512];
 
-    /* UDP DNS */
+    /* UDP DNS — must be in nat chain for DNAT to work */
     snprintf(cmd, sizeof(cmd),
-        "add rule inet proxiflare output udp dport 53 ip daddr != %s counter dnat to %s\n",
+        "add rule inet proxiflare output_nat udp dport 53 ip daddr != %s "
+        "counter dnat to %s comment \"pf_dns_leak\"\n",
         dns_server, dns_server);
     if (nft_run(cmd) != PF_OK) {
         pf_log_error("nft: dns_leak: UDP rule failed");
@@ -203,7 +279,8 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 
     /* TCP DNS */
     snprintf(cmd, sizeof(cmd),
-        "add rule inet proxiflare output tcp dport 53 ip daddr != %s counter dnat to %s\n",
+        "add rule inet proxiflare output_nat tcp dport 53 ip daddr != %s "
+        "counter dnat to %s comment \"pf_dns_leak\"\n",
         dns_server, dns_server);
     if (nft_run(cmd) != PF_OK) {
         pf_log_error("nft: dns_leak: TCP rule failed");
@@ -220,9 +297,9 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 
 int pf_nft_dns_leak_disable(void)
 {
-    /* Flush output chain and re-add base DNS NFQUEUE rule */
-    nft_run("flush chain inet proxiflare output\n");
-    nft_run("add rule inet proxiflare output udp dport 53 queue num 0\n");
-    pf_log_info("nft: DNS leak protection disabled");
+    /* Remove ONLY DNS DNAT rules from the nat chain.
+     * The output chain (route type) with cgroup marks is untouched. */
+    nft_delete_by_comment("inet", "proxiflare", "output_nat", "pf_dns_leak");
+    pf_log_info("nft: DNS leak protection disabled (cgroup marks preserved)");
     return PF_OK;
 }

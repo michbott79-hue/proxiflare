@@ -53,11 +53,11 @@ export default function Rules() {
         api.proxyList(),
         api.chainList(),
       ]);
-      setRules(r);
-      setProxies(p);
-      setChains(c);
+      setRules(Array.isArray(r) ? r : []);
+      setProxies(Array.isArray(p) ? p : []);
+      setChains(Array.isArray(c) ? c : []);
     } catch {
-      // Daemon not connected
+      setRules([]); setProxies([]); setChains([]);
     }
   }, []);
 

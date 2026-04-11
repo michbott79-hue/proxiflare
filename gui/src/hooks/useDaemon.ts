@@ -25,38 +25,44 @@ export function useDaemon() {
     error: null,
   });
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Once unlocked in this session, stay unlocked
+  const unlockedRef = useRef(false);
 
   const poll = useCallback(async () => {
     try {
-      const s = await systemStatus();
+      const raw = await systemStatus();
+      const s: DaemonStatus = (raw as any)?.result ?? raw ?? DEFAULT_STATUS;
+      // If daemon says crypto is unlocked, or we already unlocked this session
+      const daemonUnlocked = (s as any).crypto_unlocked === true;
+      if (daemonUnlocked) unlockedRef.current = true;
       setState({
         status: s,
         connected: true,
-        unlocked: true,
+        unlocked: unlockedRef.current,
         error: null,
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      // If the error indicates locked credentials, mark as connected but not unlocked
       if (msg.includes('locked') || msg.includes('Locked')) {
         setState({
           status: DEFAULT_STATUS,
           connected: true,
-          unlocked: false,
+          unlocked: unlockedRef.current,
           error: null,
         });
       } else {
-        setState({
+        setState(prev => ({
           status: DEFAULT_STATUS,
           connected: false,
-          unlocked: false,
+          unlocked: prev.unlocked,
           error: msg,
-        });
+        }));
       }
     }
   }, []);
 
   const setUnlocked = useCallback((val: boolean) => {
+    unlockedRef.current = val;
     setState(prev => ({ ...prev, unlocked: val }));
   }, []);
 

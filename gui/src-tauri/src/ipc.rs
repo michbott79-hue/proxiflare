@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-const SOCKET_PATH: &str = "/run/proxiflare.sock";
+const SOCKET_PATH: &str = "/run/proxiflare/proxiflare.sock";
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 

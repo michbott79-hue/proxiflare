@@ -12,3 +12,31 @@ body {
 ::-webkit-scrollbar-track { background: #1a1d27; }
 ::-webkit-scrollbar-thumb { background: #3d4460; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #6366f1; }
+
+/* Force dark theme on native form elements */
+select, select option {
+  background-color: #232733;
+  color: #e2e8f0;
+}
+
+select option:hover,
+select option:checked {
+  background-color: #6366f1;
+  color: #fff;
+}
+
+/* Number input spinners */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  opacity: 1;
+  filter: invert(0.8);
+}
+
+/* Autofill dark background */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 30px #232733 inset !important;
+  -webkit-text-fill-color: #e2e8f0 !important;
+  caret-color: #e2e8f0;
+}

@@ -18,10 +18,10 @@ export default function Chains() {
   const load = useCallback(async () => {
     try {
       const [c, p] = await Promise.all([api.chainList(), api.proxyList()]);
-      setChains(c);
-      setProxies(p);
+      setChains(Array.isArray(c) ? c : []);
+      setProxies(Array.isArray(p) ? p : []);
     } catch {
-      // Daemon not connected
+      setChains([]); setProxies([]);
     }
   }, []);
 

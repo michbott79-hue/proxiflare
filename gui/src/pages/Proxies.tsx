@@ -42,13 +42,14 @@ export default function Proxies() {
   const [testResults, setTestResults] = useState<Record<number, { ok: boolean; latency_ms: number | null; error?: string }>>({});
   const [saving, setSaving] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [typeDropdown, setTypeDropdown] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const list = await api.proxyList();
-      setProxies(list);
+      const result = await api.proxyList();
+      setProxies(Array.isArray(result) ? result : []);
     } catch {
-      // Daemon not connected
+      setProxies([]);
     }
   }, []);
 
@@ -244,17 +245,34 @@ export default function Proxies() {
                 />
               </div>
 
-              <div>
+              <div className="relative">
                 <label className="mb-1 block text-xs text-[#64748b]">Type</label>
-                <select
-                  value={modal.proxy.type || 'socks5'}
-                  onChange={e => updateModal('type', e.target.value)}
-                  className="w-full rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+                <button
+                  type="button"
+                  onClick={() => setTypeDropdown(p => !p)}
+                  className="flex w-full items-center justify-between rounded-md border border-[#2d3348] bg-[#232733] px-3 py-2 text-sm text-[#e2e8f0] outline-none focus:border-[#6366f1]"
                 >
-                  {PROXY_TYPES.map(t => (
-                    <option key={t} value={t}>{t.toUpperCase()}</option>
-                  ))}
-                </select>
+                  <span>{(modal.proxy.type || 'socks5').toUpperCase()}</span>
+                  <svg className="h-4 w-4 text-[#64748b]" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                  </svg>
+                </button>
+                {typeDropdown && (
+                  <div className="absolute z-50 mt-1 w-full rounded-md border border-[#2d3348] bg-[#232733] py-1 shadow-xl">
+                    {PROXY_TYPES.map(t => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => { updateModal('type', t); setTypeDropdown(false); }}
+                        className={`block w-full px-3 py-2 text-left text-sm transition-colors hover:bg-[#6366f1] hover:text-white ${
+                          modal.proxy?.type === t ? 'bg-[#6366f1]/20 text-[#818cf8]' : 'text-[#e2e8f0]'
+                        }`}
+                      >
+                        {t.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-3 gap-3">

@@ -98,6 +98,13 @@ impl DaemonClient {
                 .to_string());
         }
 
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        // Daemon double-wraps: {"id":N, "result": {"result": <data>}}
+        // Unwrap both levels to return just <data>
+        let outer = response.get("result").cloned().unwrap_or(Value::Null);
+        if let Some(inner) = outer.get("result") {
+            Ok(inner.clone())
+        } else {
+            Ok(outer)
+        }
     }
 }

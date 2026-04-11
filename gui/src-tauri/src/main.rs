@@ -35,6 +35,7 @@ fn main() {
             commands::credentials_lock,
             commands::system_status,
             commands::system_version,
+            commands::list_system_apps,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

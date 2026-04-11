@@ -141,3 +141,15 @@ export async function systemStatus(): Promise<DaemonStatus> {
 export async function systemVersion(): Promise<string> {
   return invoke<string>('system_version');
 }
+
+// ── System apps ─────────────────────────────────────────────────
+
+export interface SystemApp {
+  name: string;
+  exec: string;
+  icon: string;
+}
+
+export async function listSystemApps(): Promise<SystemApp[]> {
+  return invoke<SystemApp[]>('list_system_apps');
+}

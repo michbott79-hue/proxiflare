@@ -86,8 +86,15 @@ export default function Proxies() {
     setTesting(prev => ({ ...prev, [id]: true }));
     setTestResults(prev => { const n = { ...prev }; delete n[id]; return n; });
     try {
-      const result = await api.proxyTest(id);
-      setTestResults(prev => ({ ...prev, [id]: result }));
+      const raw = await api.proxyTest(id) as any;
+      // Daemon returns {latency_ms: N, health: "online"|"offline"}
+      const latency = raw?.latency_ms ?? -1;
+      const health = raw?.health ?? 'error';
+      if (latency >= 0 && health === 'online') {
+        setTestResults(prev => ({ ...prev, [id]: { ok: true, latency_ms: latency } }));
+      } else {
+        setTestResults(prev => ({ ...prev, [id]: { ok: false, latency_ms: null, error: `Proxy unreachable (${health})` } }));
+      }
     } catch (e) {
       setTestResults(prev => ({ ...prev, [id]: { ok: false, latency_ms: null, error: String(e) } }));
     } finally {

@@ -232,3 +232,58 @@ pub fn system_status(client: State<DaemonClient>) -> Result<Value, String> {
 pub fn system_version(client: State<DaemonClient>) -> Result<Value, String> {
     client.send_request("system.version", json!({}))
 }
+
+// ── System apps ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn list_system_apps() -> Result<Value, String> {
+    use std::fs;
+    use std::path::Path;
+
+    let mut apps: Vec<Value> = Vec::new();
+    let dirs = ["/usr/share/applications", "/var/lib/flatpak/exports/share/applications",
+                &format!("{}/.local/share/applications", std::env::var("HOME").unwrap_or_default())];
+
+    for dir in &dirs {
+        let path = Path::new(dir);
+        if !path.exists() { continue; }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let fpath = entry.path();
+                if fpath.extension().map_or(true, |e| e != "desktop") { continue; }
+                if let Ok(content) = fs::read_to_string(&fpath) {
+                    let mut name = String::new();
+                    let mut exec = String::new();
+                    let mut icon = String::new();
+                    let mut nodisplay = false;
+                    for line in content.lines() {
+                        if line.starts_with("Name=") && name.is_empty() {
+                            name = line[5..].to_string();
+                        } else if line.starts_with("Exec=") && exec.is_empty() {
+                            // Extract binary path, remove %u %F etc
+                            exec = line[5..].split_whitespace().next().unwrap_or("").to_string();
+                        } else if line.starts_with("Icon=") && icon.is_empty() {
+                            icon = line[5..].to_string();
+                        } else if line == "NoDisplay=true" {
+                            nodisplay = true;
+                        }
+                    }
+                    if !name.is_empty() && !exec.is_empty() && !nodisplay {
+                        apps.push(json!({"name": name, "exec": exec, "icon": icon}));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by name
+    apps.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+    });
+
+    // Deduplicate by exec
+    apps.dedup_by(|a, b| a["exec"] == b["exec"]);
+
+    Ok(Value::Array(apps))
+}

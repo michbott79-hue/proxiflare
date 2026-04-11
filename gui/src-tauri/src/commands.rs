@@ -254,6 +254,28 @@ pub fn dns_leak_status(client: State<DaemonClient>) -> Result<Value, String> {
     client.send_request("dns_leak.status", json!({}))
 }
 
+// ── Debug: test log event emission ──────────────────────────────────────────
+
+#[tauri::command]
+pub fn test_log_event(app: tauri::AppHandle) -> Result<Value, String> {
+    use tauri::Emitter;
+    let test_data = json!({
+        "ts": 1712834400,
+        "app": "test-app",
+        "pid": 1234,
+        "domain": "test.example.com",
+        "dst_ip": "1.2.3.4",
+        "dst_port": 443,
+        "proxy": "TestProxy",
+        "action": "PROXY",
+        "bytes_tx": 1024,
+        "bytes_rx": 4096,
+        "latency_ms": 42
+    });
+    app.emit("log-entry", &test_data).map_err(|e| format!("emit failed: {}", e))?;
+    Ok(json!("emitted"))
+}
+
 // ── System apps ─────────────────────────────────────────────────────────────
 
 #[tauri::command]

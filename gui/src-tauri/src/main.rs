@@ -39,6 +39,7 @@ fn main() {
             commands::dns_leak_disable,
             commands::dns_leak_status,
             commands::list_system_apps,
+            commands::test_log_event,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

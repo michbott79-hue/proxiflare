@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import type { RuleAction } from '../lib/types';
 import { useLog } from '../hooks/useLog';
 
@@ -117,6 +118,12 @@ export default function Log() {
             className="rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#64748b] transition-colors hover:text-[#e2e8f0]"
           >
             Clear
+          </button>
+          <button
+            onClick={() => invoke('test_log_event').catch(console.error)}
+            className="rounded-md border border-[#6366f1] bg-[#6366f1]/10 px-3 py-1.5 text-xs text-[#818cf8] transition-colors hover:bg-[#6366f1]/20"
+          >
+            Test Event
           </button>
         </div>
       </div>

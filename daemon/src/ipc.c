@@ -135,14 +135,22 @@ int pf_ipc_send(pf_ipc_client_t *client, cJSON *msg)
     free(raw);
 
     size_t sent = 0;
+    int retries = 0;
     while (sent < total) {
         ssize_t n = write(client->fd, buf + sent, total - sent);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && retries < 50) {
+                /* Non-blocking fd not ready — brief pause and retry */
+                usleep(1000); /* 1ms */
+                retries++;
+                continue;
+            }
             free(buf);
             return -1;
         }
         sent += (size_t)n;
+        retries = 0;
     }
 
     free(buf);

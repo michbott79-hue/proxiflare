@@ -5,15 +5,17 @@ import Proxies from './pages/Proxies';
 import Rules from './pages/Rules';
 import Chains from './pages/Chains';
 import Log from './pages/Log';
+import Inspect from './pages/Inspect';
 import Settings from './pages/Settings';
 
-type Tab = 'proxies' | 'rules' | 'chains' | 'log' | 'settings';
+type Tab = 'proxies' | 'rules' | 'chains' | 'log' | 'inspect' | 'settings';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'proxies', label: 'Proxies' },
   { id: 'rules', label: 'Rules' },
   { id: 'chains', label: 'Chains' },
   { id: 'log', label: 'Log' },
+  { id: 'inspect', label: 'Inspect' },
   { id: 'settings', label: 'Settings' },
 ];
 
@@ -30,6 +32,7 @@ export default function App() {
       case 'rules': return <Rules />;
       case 'chains': return <Chains />;
       case 'log': return <Log />;
+      case 'inspect': return <Inspect />;
       case 'settings': return <Settings daemon={daemon} />;
     }
   }

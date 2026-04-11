@@ -254,6 +254,33 @@ pub fn dns_leak_status(client: State<DaemonClient>) -> Result<Value, String> {
     client.send_request("dns_leak.status", json!({}))
 }
 
+// ── Inspect (MITM) ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn inspect_list(client: State<DaemonClient>, since_seq: u64) -> Result<Value, String> {
+    client.send_request("inspect.list", json!({ "since_seq": since_seq }))
+}
+
+#[tauri::command]
+pub fn inspect_enable(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("inspect.enable", json!({}))
+}
+
+#[tauri::command]
+pub fn inspect_disable(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("inspect.disable", json!({}))
+}
+
+#[tauri::command]
+pub fn inspect_status(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("inspect.status", json!({}))
+}
+
+#[tauri::command]
+pub fn inspect_generate_ca(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("inspect.generate_ca", json!({}))
+}
+
 // ── Log polling ─────────────────────────────────────────────────────────────
 
 #[tauri::command]

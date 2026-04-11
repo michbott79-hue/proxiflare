@@ -32,6 +32,8 @@
 #include "monitor.h"
 #include "logger.h"
 #include "stats.h"
+#include "mitm.h"
+#include "http_parser.h"
 #include <cJSON.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -60,12 +62,89 @@ struct pf_ctx {
     pf_ssh_pool_t  ssh_pool;
     pf_stats_t     stats;
     pf_monitor_t   monitor;
+    pf_mitm_t      mitm;
     int            epoll_fd;
     volatile int   running;   /* volatile int, not bool, for signal safety */
 };
 
 /* Single static instance — avoids putting ~6MB on the stack */
 static struct pf_ctx g_ctx;
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * HTTP inspect ring buffer — stores intercepted request/response summaries
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define PF_INSPECT_RING_SIZE 200
+
+static cJSON   *g_inspect_ring[PF_INSPECT_RING_SIZE];
+static int      g_inspect_ring_head  = 0;
+static int      g_inspect_ring_count = 0;
+static uint64_t g_inspect_seq        = 0;
+
+/* Callback from tproxy relay — parse HTTP and store in ring */
+static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
+                            const pf_connection_t *conn, void *userdata)
+{
+    (void)userdata;
+    if (!data || len < 4) return;
+
+    pf_http_msg_t msg;
+    int rc;
+
+    if (is_request)
+        rc = pf_http_parse_request((const char *)data, len, &msg);
+    else
+        rc = pf_http_parse_response((const char *)data, len, &msg);
+
+    if (rc != 0) return; /* not a complete HTTP message (yet) */
+
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddNumberToObject(entry, "seq", (double)(++g_inspect_seq));
+    cJSON_AddNumberToObject(entry, "ts", (double)time(NULL));
+    cJSON_AddStringToObject(entry, "domain", conn->domain[0] ? conn->domain : conn->dst_ip);
+    cJSON_AddStringToObject(entry, "dst_ip", conn->dst_ip);
+    cJSON_AddNumberToObject(entry, "dst_port", (double)conn->dst_port);
+    cJSON_AddBoolToObject(entry, "is_request", is_request ? 1 : 0);
+    cJSON_AddBoolToObject(entry, "tls", conn->is_tls ? 1 : 0);
+
+    if (is_request) {
+        cJSON_AddStringToObject(entry, "method", msg.method);
+        cJSON_AddStringToObject(entry, "url", msg.url);
+        cJSON_AddStringToObject(entry, "version", msg.version);
+    } else {
+        cJSON_AddNumberToObject(entry, "status", msg.status_code);
+        cJSON_AddStringToObject(entry, "status_text", msg.status_text);
+        cJSON_AddStringToObject(entry, "version", msg.version);
+    }
+
+    /* Headers as object */
+    cJSON *hdrs = cJSON_CreateObject();
+    for (int i = 0; i < msg.header_count; i++)
+        cJSON_AddStringToObject(hdrs, msg.headers[i].key, msg.headers[i].value);
+    cJSON_AddItemToObject(entry, "headers", hdrs);
+
+    /* Body (truncated to 4KB for JSON transport) */
+    if (msg.body && msg.body_len > 0) {
+        size_t cap = msg.body_len < 4096 ? msg.body_len : 4096;
+        char *body_str = (char *)malloc(cap + 1);
+        if (body_str) {
+            memcpy(body_str, msg.body, cap);
+            body_str[cap] = '\0';
+            cJSON_AddStringToObject(entry, "body", body_str);
+            cJSON_AddNumberToObject(entry, "body_len", (double)msg.body_len);
+            free(body_str);
+        }
+    }
+
+    cJSON_AddNumberToObject(entry, "content_length", (double)msg.content_length);
+
+    /* Store in ring buffer */
+    if (g_inspect_ring[g_inspect_ring_head])
+        cJSON_Delete(g_inspect_ring[g_inspect_ring_head]);
+    g_inspect_ring[g_inspect_ring_head] = entry;
+    g_inspect_ring_head = (g_inspect_ring_head + 1) % PF_INSPECT_RING_SIZE;
+    if (g_inspect_ring_count < PF_INSPECT_RING_SIZE) g_inspect_ring_count++;
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  * String conversion helpers (referenced by proxiflare.h, used by all modules)
@@ -1013,6 +1092,65 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         }
         cJSON_AddItemToObject(resp, "result", arr);
 
+    /* ── inspect.list ──────────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.list") == 0) {
+        int since_seq = 0;
+        cJSON *since = params ? cJSON_GetObjectItem(params, "since_seq") : NULL;
+        if (since) since_seq = (int)since->valuedouble;
+
+        cJSON *arr = cJSON_CreateArray();
+        for (int ii = 0; ii < g_inspect_ring_count; ii++) {
+            int idx = (g_inspect_ring_head - g_inspect_ring_count + ii + PF_INSPECT_RING_SIZE)
+                      % PF_INSPECT_RING_SIZE;
+            if (g_inspect_ring[idx]) {
+                cJSON *seq_item = cJSON_GetObjectItem(g_inspect_ring[idx], "seq");
+                if (seq_item && seq_item->valuedouble > since_seq)
+                    cJSON_AddItemToArray(arr, cJSON_Duplicate(g_inspect_ring[idx], 1));
+            }
+        }
+        cJSON_AddItemToObject(resp, "result", arr);
+
+    /* ── inspect.enable ─────────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.enable") == 0) {
+        if (!ctx->mitm.ca_key) {
+            cJSON_AddStringToObject(resp, "error",
+                "CA not generated. Run: sudo proxiflare-daemon --generate-ca");
+        } else {
+            ctx->mitm.enabled = 1;
+            pf_config_set(&ctx->config, "inspect_enabled", "true");
+            cJSON_AddStringToObject(resp, "result", "ok");
+            pf_log_info("mitm: inspection ENABLED");
+        }
+
+    /* ── inspect.disable ────────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.disable") == 0) {
+        ctx->mitm.enabled = 0;
+        pf_config_set(&ctx->config, "inspect_enabled", "false");
+        cJSON_AddStringToObject(resp, "result", "ok");
+        pf_log_info("mitm: inspection DISABLED");
+
+    /* ── inspect.status ─────────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.status") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject(r, "enabled", ctx->mitm.enabled ? 1 : 0);
+        cJSON_AddBoolToObject(r, "ca_installed", ctx->mitm.ca_key ? 1 : 0);
+        cJSON_AddStringToObject(r, "ca_cert_path", PF_MITM_CA_CERT_PATH);
+        cJSON_AddNumberToObject(r, "cached_certs", ctx->mitm.cache_count);
+        cJSON_AddItemToObject(resp, "result", r);
+
+    /* ── inspect.generate_ca ────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.generate_ca") == 0) {
+        if (pf_mitm_generate_ca() == PF_OK) {
+            /* Reload CA into the running engine */
+            pf_mitm_close(&ctx->mitm);
+            if (pf_mitm_init(&ctx->mitm) == PF_OK)
+                cJSON_AddStringToObject(resp, "result", "ok");
+            else
+                cJSON_AddStringToObject(resp, "error", "CA generated but init failed");
+        } else {
+            cJSON_AddStringToObject(resp, "error", "CA generation failed");
+        }
+
     /* ── unknown ─────────────────────────────────────────────────────────── */
     } else {
         cJSON_AddStringToObject(resp, "error", "unknown method");
@@ -1082,8 +1220,22 @@ int main(int argc, char *argv[])
             foreground = 1;
         } else if (strcmp(argv[i], "--config-dir") == 0 && i + 1 < argc) {
             config_dir = argv[++i];
+        } else if (strcmp(argv[i], "--generate-ca") == 0) {
+            /* Generate CA cert and exit */
+            if (pf_mitm_generate_ca() == PF_OK) {
+                printf("CA generated:\n  Key:  %s\n  Cert: %s\n\n"
+                       "Import the cert in your browser to enable HTTPS inspection.\n"
+                       "Firefox: Preferences → Certificates → Import\n"
+                       "System:  sudo cp %s /usr/local/share/ca-certificates/proxiflare.crt "
+                       "&& sudo update-ca-certificates\n",
+                       PF_MITM_CA_KEY_PATH, PF_MITM_CA_CERT_PATH, PF_MITM_CA_CERT_PATH);
+                return 0;
+            } else {
+                fprintf(stderr, "ERROR: CA generation failed\n");
+                return 1;
+            }
         } else {
-            fprintf(stderr, "Usage: %s [--foreground] [--config-dir PATH]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--foreground] [--config-dir PATH] [--generate-ca]\n", argv[0]);
             return 1;
         }
     }
@@ -1188,6 +1340,20 @@ int main(int argc, char *argv[])
     /* 5g. SSH pool */
     if (pf_ssh_pool_init(&ctx->ssh_pool) != PF_OK)
         pf_log_warn("ssh_pool_init failed — SSH proxies will not work");
+
+    /* 5g-bis. MITM engine */
+    if (pf_mitm_init(&ctx->mitm) != PF_OK) {
+        pf_log_warn("mitm_init failed — HTTPS interception disabled");
+    } else {
+        pf_tproxy_set_inspect_cb(on_inspect_data, ctx);
+        /* Restore inspect state from config */
+        char inspect_val[8] = "false";
+        pf_config_get(&ctx->config, "inspect_enabled", inspect_val, (int)sizeof(inspect_val));
+        if (strcmp(inspect_val, "true") == 0 && ctx->mitm.ca_key) {
+            ctx->mitm.enabled = 1;
+            pf_log_info("mitm: inspection restored (enabled)");
+        }
+    }
 
     /* 5h. DNS (NFQUEUE) — optional, requires root + kernel module */
     if (pf_dns_init(&ctx->dns, ctx->ruleset) != PF_OK) {
@@ -1324,11 +1490,36 @@ int main(int argc, char *argv[])
                 if (ctx->tproxy.listen_fd > 0 && fd == ctx->tproxy.listen_fd) {
                     int slot = pf_tproxy_accept(&ctx->tproxy);
                     if (slot >= 0 && ctx->tproxy.conns[slot].active) {
+                        pf_connection_t *c = &ctx->tproxy.conns[slot];
+
+                        /* MITM TLS interception: if enabled and connection is TLS,
+                         * wrap both sides in SSL for decrypted inspection */
+                        if (ctx->mitm.enabled && ctx->mitm.ca_key && c->is_tls && c->domain[0]) {
+                            /* Make fds blocking for SSL handshake */
+                            c->server_ssl = pf_mitm_wrap_server(&ctx->mitm, c->proxy_fd, c->domain);
+                            if (c->server_ssl) {
+                                c->client_ssl = pf_mitm_wrap_client(&ctx->mitm, c->client_fd, c->domain);
+                                if (c->client_ssl) {
+                                    c->inspect = true;
+                                    pf_log_info("mitm: INSPECT active for %s:%d",
+                                                c->domain, c->dst_port);
+                                } else {
+                                    SSL_free(c->server_ssl);
+                                    c->server_ssl = NULL;
+                                    pf_log_warn("mitm: client TLS wrap failed for %s", c->domain);
+                                }
+                            } else {
+                                pf_log_warn("mitm: server TLS wrap failed for %s", c->domain);
+                            }
+                        }
+                        /* For non-TLS HTTP with inspect enabled, also set inspect flag */
+                        else if (ctx->mitm.enabled && !c->is_tls) {
+                            c->inspect = true;
+                        }
+
                         /* Register both fds in main epoll for relay */
-                        epoll_add(ctx->epoll_fd,
-                                  ctx->tproxy.conns[slot].client_fd, EPOLLIN);
-                        epoll_add(ctx->epoll_fd,
-                                  ctx->tproxy.conns[slot].proxy_fd,  EPOLLIN);
+                        epoll_add(ctx->epoll_fd, c->client_fd, EPOLLIN);
+                        epoll_add(ctx->epoll_fd, c->proxy_fd,  EPOLLIN);
                     }
                     continue;
                 }
@@ -1395,6 +1586,7 @@ shutdown:
     if (ctx->dns.fd >= 0)
         pf_dns_close(&ctx->dns);
 
+    pf_mitm_close(&ctx->mitm);
     pf_ssh_pool_close(&ctx->ssh_pool);
     pf_ipc_close(&ctx->ipc);
     pf_logger_close(&ctx->logger);

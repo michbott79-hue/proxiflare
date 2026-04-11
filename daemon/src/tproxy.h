@@ -3,6 +3,7 @@
 
 #include "proxiflare.h"
 #include <stdbool.h>
+#include <openssl/ssl.h>
 
 #define PF_TPROXY_PORT       12345
 #define PF_MAX_CONNECTIONS   1024
@@ -11,6 +12,8 @@
 typedef struct {
     int      client_fd;
     int      proxy_fd;       /* fd connected through proxy to destination */
+    SSL     *client_ssl;     /* non-NULL when MITM inspect is active */
+    SSL     *server_ssl;     /* non-NULL when MITM inspect is active */
     char     domain[PF_DOMAIN_MAX];
     char     dst_ip[46];
     int      dst_port;
@@ -18,6 +21,8 @@ typedef struct {
     uint64_t bytes_tx;
     uint64_t bytes_rx;
     bool     active;
+    bool     inspect;        /* MITM interception active on this connection */
+    bool     is_tls;         /* original connection was TLS */
 } pf_connection_t;
 
 /*
@@ -46,5 +51,10 @@ void pf_tproxy_close_conn(pf_tproxy_t *tp, int conn_idx);
 
 /* Set the proxy connect callback (called from main.c after init) */
 void pf_tproxy_set_connect_cb(pf_tproxy_t *tp, pf_tproxy_connect_cb cb, void *userdata);
+
+/* Set HTTP inspect callback — called with decrypted data for each relay chunk */
+void pf_tproxy_set_inspect_cb(void (*cb)(const uint8_t *data, size_t len, int is_request,
+                                          const pf_connection_t *conn, void *userdata),
+                               void *userdata);
 
 #endif /* PF_TPROXY_H */

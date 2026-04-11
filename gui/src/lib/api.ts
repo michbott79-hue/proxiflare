@@ -183,6 +183,30 @@ export async function logRecent(sinceSeq: number): Promise<LogEntryRaw[]> {
   return Array.isArray(result) ? result : [];
 }
 
+// ── Inspect (MITM HTTP interception) ───────────────────────────────────────
+
+export async function inspectList(sinceSeq: number): Promise<any[]> {
+  const result = await invoke<any>('inspect_list', { sinceSeq });
+  return Array.isArray(result) ? result : [];
+}
+
+export async function inspectEnable(): Promise<void> {
+  return invoke<void>('inspect_enable');
+}
+
+export async function inspectDisable(): Promise<void> {
+  return invoke<void>('inspect_disable');
+}
+
+export async function inspectStatus(): Promise<any> {
+  const raw = await invoke<any>('inspect_status');
+  return raw?.result ?? raw ?? { enabled: false, ca_installed: false };
+}
+
+export async function inspectGenerateCa(): Promise<void> {
+  return invoke<void>('inspect_generate_ca');
+}
+
 // ── System apps ─────────────────────────────────────────────────
 
 export interface SystemApp {

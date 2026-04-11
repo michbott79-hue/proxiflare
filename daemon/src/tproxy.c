@@ -11,6 +11,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Internal helpers
@@ -192,10 +194,12 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
     uint8_t peek_buf[4096]; /* Must be large enough for full TLS ClientHello */
     char    domain[PF_DOMAIN_MAX] = {0};
 
+    bool is_tls = false;
     ssize_t n = recv(cfd, peek_buf, sizeof(peek_buf), MSG_PEEK | MSG_DONTWAIT);
     if (n > 0 && peek_buf[0] == 0x16) {
         /* Looks like TLS — try to extract SNI */
         pf_sni_extract(peek_buf, (size_t)n, domain, sizeof(domain));
+        is_tls = true;
     }
 
     /* ── Connect through proxy via callback ─────────────────────────────── */
@@ -268,6 +272,7 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
 
     strncpy(conn->dst_ip, dst_ip, sizeof(conn->dst_ip) - 1);
     strncpy(conn->domain, domain, sizeof(conn->domain) - 1);
+    conn->is_tls = is_tls;
 
     set_nonblocking(cfd);
     set_nonblocking(proxy_fd);
@@ -283,6 +288,61 @@ int pf_tproxy_accept(pf_tproxy_t *tp)
  * Returns PF_OK on success, PF_ERR when one side closed/errored.
  * ───────────────────────────────────────────────────────────────────────────── */
 
+/* ── Relay helpers for plain fd and SSL ───────────────────────────────────── */
+
+static ssize_t relay_read(pf_connection_t *conn, int is_client, uint8_t *buf, size_t sz)
+{
+    if (conn->inspect && is_client && conn->client_ssl)
+        return SSL_read(conn->client_ssl, buf, (int)sz);
+    if (conn->inspect && !is_client && conn->server_ssl)
+        return SSL_read(conn->server_ssl, buf, (int)sz);
+    return read(is_client ? conn->client_fd : conn->proxy_fd, buf, sz);
+}
+
+static ssize_t relay_write(pf_connection_t *conn, int is_client, const uint8_t *buf, size_t sz)
+{
+    if (conn->inspect && is_client && conn->client_ssl)
+        return SSL_write(conn->client_ssl, buf, (int)sz);
+    if (conn->inspect && !is_client && conn->server_ssl)
+        return SSL_write(conn->server_ssl, buf, (int)sz);
+    return write(is_client ? conn->client_fd : conn->proxy_fd, buf, sz);
+}
+
+static int relay_check_err(pf_connection_t *conn, int is_client, ssize_t ret)
+{
+    if (ret > 0) return 0; /* ok */
+    if (ret == 0) return -1; /* closed */
+
+    if (conn->inspect) {
+        SSL *ssl = is_client ? conn->client_ssl : conn->server_ssl;
+        if (ssl) {
+            int err = SSL_get_error(ssl, (int)ret);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                return 1; /* retry */
+        }
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        return 1; /* retry */
+    return -1; /* fatal */
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_tproxy_relay — bidirectional data relay with optional SSL + HTTP parsing
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Callback for HTTP inspection — set by main.c */
+static void (*g_inspect_cb)(const uint8_t *data, size_t len, int is_request,
+                            const pf_connection_t *conn, void *userdata) = NULL;
+static void *g_inspect_userdata = NULL;
+
+void pf_tproxy_set_inspect_cb(void (*cb)(const uint8_t *, size_t, int,
+                                          const pf_connection_t *, void *),
+                               void *userdata)
+{
+    g_inspect_cb = cb;
+    g_inspect_userdata = userdata;
+}
+
 int pf_tproxy_relay(pf_tproxy_t *tp, int conn_idx)
 {
     if (!tp || conn_idx < 0 || conn_idx >= PF_MAX_CONNECTIONS)
@@ -293,57 +353,53 @@ int pf_tproxy_relay(pf_tproxy_t *tp, int conn_idx)
         return PF_ERR;
 
     uint8_t buf[PF_BUF_SIZE];
-    bool any_data = false;
 
-    /* client → proxy */
-    ssize_t n = read(conn->client_fd, buf, sizeof(buf));
+    /* client → proxy (request direction) */
+    ssize_t n = relay_read(conn, 1, buf, sizeof(buf));
     if (n > 0) {
+        /* Inspect callback for request data */
+        if (conn->inspect && g_inspect_cb)
+            g_inspect_cb(buf, (size_t)n, 1, conn, g_inspect_userdata);
+
         ssize_t written = 0;
         while (written < n) {
-            ssize_t w = write(conn->proxy_fd, buf + written, (size_t)(n - written));
-            if (w < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            ssize_t w = relay_write(conn, 0, buf + written, (size_t)(n - written));
+            if (w <= 0) {
+                if (relay_check_err(conn, 0, w) == 1) break; /* EAGAIN */
                 pf_tproxy_close_conn(tp, conn_idx);
                 return PF_ERR;
             }
             written += w;
         }
         conn->bytes_tx += (uint64_t)n;
-        any_data = true;
-    } else if (n == 0) {
-        /* Client closed connection */
-        pf_tproxy_close_conn(tp, conn_idx);
-        return PF_ERR;
-    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        pf_tproxy_close_conn(tp, conn_idx);
-        return PF_ERR;
+    } else {
+        int rc = relay_check_err(conn, 1, n);
+        if (rc < 0) { pf_tproxy_close_conn(tp, conn_idx); return PF_ERR; }
     }
 
-    /* proxy → client */
-    n = read(conn->proxy_fd, buf, sizeof(buf));
+    /* proxy → client (response direction) */
+    n = relay_read(conn, 0, buf, sizeof(buf));
     if (n > 0) {
+        /* Inspect callback for response data */
+        if (conn->inspect && g_inspect_cb)
+            g_inspect_cb(buf, (size_t)n, 0, conn, g_inspect_userdata);
+
         ssize_t written = 0;
         while (written < n) {
-            ssize_t w = write(conn->client_fd, buf + written, (size_t)(n - written));
-            if (w < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            ssize_t w = relay_write(conn, 1, buf + written, (size_t)(n - written));
+            if (w <= 0) {
+                if (relay_check_err(conn, 1, w) == 1) break;
                 pf_tproxy_close_conn(tp, conn_idx);
                 return PF_ERR;
             }
             written += w;
         }
         conn->bytes_rx += (uint64_t)n;
-        any_data = true;
-    } else if (n == 0) {
-        /* Proxy closed connection */
-        pf_tproxy_close_conn(tp, conn_idx);
-        return PF_ERR;
-    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        pf_tproxy_close_conn(tp, conn_idx);
-        return PF_ERR;
+    } else {
+        int rc = relay_check_err(conn, 0, n);
+        if (rc < 0) { pf_tproxy_close_conn(tp, conn_idx); return PF_ERR; }
     }
 
-    (void)any_data;
     return PF_OK;
 }
 
@@ -359,6 +415,18 @@ void pf_tproxy_close_conn(pf_tproxy_t *tp, int conn_idx)
     pf_connection_t *conn = &tp->conns[conn_idx];
     if (!conn->active) return;
 
+    /* Shutdown SSL before closing fds */
+    if (conn->client_ssl) {
+        SSL_shutdown(conn->client_ssl);
+        SSL_free(conn->client_ssl);
+        conn->client_ssl = NULL;
+    }
+    if (conn->server_ssl) {
+        SSL_shutdown(conn->server_ssl);
+        SSL_free(conn->server_ssl);
+        conn->server_ssl = NULL;
+    }
+
     if (conn->client_fd >= 0) {
         close(conn->client_fd);
         conn->client_fd = -1;
@@ -368,7 +436,8 @@ void pf_tproxy_close_conn(pf_tproxy_t *tp, int conn_idx)
         conn->proxy_fd = -1;
     }
 
-    conn->active = false;
+    conn->active  = false;
+    conn->inspect = false;
 
     if (tp->conn_count > 0)
         tp->conn_count--;

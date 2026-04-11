@@ -53,6 +53,8 @@ set(DAEMON_SOURCES
     src/monitor.c
     src/logger.c
     src/stats.c
+    src/mitm.c
+    src/http_parser.c
     vendor/cJSON/cJSON.c
 )
 

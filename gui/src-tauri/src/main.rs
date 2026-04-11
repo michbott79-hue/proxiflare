@@ -40,6 +40,11 @@ fn main() {
             commands::dns_leak_status,
             commands::list_system_apps,
             commands::log_recent,
+            commands::inspect_list,
+            commands::inspect_enable,
+            commands::inspect_disable,
+            commands::inspect_status,
+            commands::inspect_generate_ca,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

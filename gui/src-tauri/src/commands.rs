@@ -114,6 +114,7 @@ pub fn rule_edit(
     client: State<DaemonClient>,
     id: u32,
     name: String,
+    enabled: bool,
     priority: u32,
     match_app: String,
     match_domain: String,
@@ -128,6 +129,7 @@ pub fn rule_edit(
         json!({
             "id": id,
             "name": name,
+            "enabled": enabled,
             "priority": priority,
             "match_app": match_app,
             "match_domain": match_domain,

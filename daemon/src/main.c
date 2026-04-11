@@ -311,27 +311,43 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     pf_ctx_t *ctx = (pf_ctx_t *)userdata;
     if (!ctx || !ctx->ruleset) return -1;
 
-    /* Try DNS cache first for domain resolution + cached rule match */
+    /* Traffic arrives at TPROXY because nftables cgroup match marked it.
+     * This means a rule with action=PROXY and a cgroup is responsible.
+     * Strategy: try domain-based match first, then fall back to finding
+     * ANY active PROXY rule with an app_path (those are the ones with cgroups). */
     const char *match_domain = (domain && domain[0]) ? domain : NULL;
-    const pf_dns_entry_t *dns_entry = NULL;
 
     if (!match_domain && dst_ip && dst_ip[0]) {
-        dns_entry = pf_dns_lookup(&ctx->dns, dst_ip);
+        const pf_dns_entry_t *dns_entry = pf_dns_lookup(&ctx->dns, dst_ip);
         if (dns_entry && dns_entry->domain[0])
             match_domain = dns_entry->domain;
     }
 
-    /* Match against rules */
+    /* First try: match by domain/IP (for domain-based rules) */
     const pf_rule_t *rule = pf_rules_match(ctx->ruleset, NULL, match_domain,
                                            dst_ip, dst_port);
+
+    /* If no match or DIRECT, try finding the app-based PROXY rule that sent
+     * this traffic here (it's marked because the process is in a cgroup) */
+    if (!rule || rule->action == PF_ACTION_DIRECT) {
+        for (int i = 0; i < ctx->ruleset->count; i++) {
+            const pf_rule_t *r = &ctx->ruleset->rules[i];
+            if (r->enabled && r->action == PF_ACTION_PROXY &&
+                r->app_path[0] && r->proxy_id > 0) {
+                rule = r;
+                break;
+            }
+        }
+    }
+
     if (!rule || rule->action == PF_ACTION_DIRECT)
-        return -1;  /* direct / no match */
+        return -1;
 
     if (rule->action == PF_ACTION_BLOCK || rule->action == PF_ACTION_REJECT)
-        return -2;  /* block */
+        return -2;
 
     if (rule->action != PF_ACTION_PROXY || rule->proxy_id == 0)
-        return -1;  /* only PROXY action supported for now */
+        return -1;
 
     /* Look up the proxy */
     pf_proxy_t proxy;

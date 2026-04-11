@@ -65,6 +65,7 @@ export async function ruleEdit(rule: Rule): Promise<Rule> {
   return invoke<Rule>('rule_edit', {
     id: rule.id,
     name: rule.name,
+    enabled: rule.enabled,
     priority: rule.priority,
     matchApp: rule.match_app || '',
     matchDomain: rule.match_domain || '',

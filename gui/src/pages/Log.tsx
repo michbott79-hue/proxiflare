@@ -140,24 +140,24 @@ export default function Log() {
                 key={idx}
                 className={`py-0.5 leading-5 ${ACTION_COLORS[entry.action as RuleAction] ?? 'text-[#94a3b8]'}`}
               >
-                <span className="text-[#64748b]">[{formatTime(entry.ts)}]</span>{' '}
-                <span className="text-[#e2e8f0]">{entry.domain || entry.dst_ip}</span>
-                {' → '}
-                <span className="text-[#64748b]">{entry.dst_ip}:{entry.dst_port}</span>
-                {' via '}
-                <span className="text-[#818cf8]">{entry.app || `proxy#${entry.proxy_id}`}</span>
-                {' '}
-                <span className="font-semibold">[{entry.action}]</span>
+                <span className="text-[#64748b]">[{formatTime(entry.ts)}]</span>
                 {' '}
                 <span className={entry.success ? 'text-[#4ade80]' : 'text-[#f87171]'}>
                   {entry.success ? '✓' : '✗'}
                 </span>
                 {' '}
-                <span className="text-[#64748b]">
-                  {formatBytes(entry.bytes_tx)}/{formatBytes(entry.bytes_rx)}
-                </span>
+                <span className="text-[#f59e0b]">{entry.app?.split('/').pop() || entry.rule || '?'}</span>
+                {' → '}
+                <span className="text-[#e2e8f0]">{entry.domain || entry.dst_ip}</span>
+                {entry.domain && <span className="text-[#64748b]"> ({entry.dst_ip})</span>}
+                <span className="text-[#64748b]">:{entry.dst_port}</span>
                 {' '}
-                <span className="text-[#64748b]">{entry.latency_ms}ms</span>
+                <span className="text-[#64748b]">via</span>
+                {' '}
+                <span className="text-[#818cf8] font-semibold">{entry.proxy || `proxy#${entry.proxy_id}`}</span>
+                {(entry.bytes_tx > 0 || entry.bytes_rx > 0) && (
+                  <span className="text-[#64748b]"> {formatBytes(entry.bytes_tx)}↑ {formatBytes(entry.bytes_rx)}↓</span>
+                )}
               </div>
             ))}
           </div>

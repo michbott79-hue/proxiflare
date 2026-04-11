@@ -163,17 +163,18 @@ export async function dnsLeakStatus(): Promise<{ enabled: boolean; dns_server: s
 
 export interface LogEntryRaw {
   ts: number;
-  app: string;
-  uid?: number;
+  app: string;       // app path or rule name
+  rule: string;      // rule name
+  proxy: string;     // proxy name
+  proxy_id: number;
   domain: string;
   dst_ip: string;
   dst_port: number;
-  proxy_id: number;
   action: string;
+  success: number;
   bytes_tx: number;
   bytes_rx: number;
   latency_ms: number;
-  success: number;
   seq: number;
 }
 

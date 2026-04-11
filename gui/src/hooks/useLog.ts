@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { logRecent, type LogEntryRaw } from '../lib/api';
 
-const MAX_ENTRIES = 5000;
-const POLL_INTERVAL = 500; // ms
+const MAX_ENTRIES = 200;
+const POLL_INTERVAL = 1000; // ms
 
 export function useLog() {
   const [entries, setEntries] = useState<LogEntryRaw[]>([]);

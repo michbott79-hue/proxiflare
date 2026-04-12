@@ -33,10 +33,15 @@ static int write_file(const char *path, const char *data)
     return 0;
 }
 
-/* Build the path for a rule's cgroup dir */
-static void rule_path(int rule_id, char *buf, size_t bufsz)
+/* Build the path for a rule's cgroup dir. rule_id must be positive — negative
+ * values would produce `rule_-N` which still lives under PF_CGROUP_BASE so
+ * there is no traversal, but rejecting early catches garbage early. */
+static int rule_path(int rule_id, char *buf, size_t bufsz)
 {
-    snprintf(buf, bufsz, PF_CGROUP_BASE "/rule_%d", rule_id);
+    if (rule_id <= 0) return -1;
+    int n = snprintf(buf, bufsz, PF_CGROUP_BASE "/rule_%d", rule_id);
+    if (n < 0 || (size_t)n >= bufsz) return -1;
+    return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -70,7 +75,7 @@ int pf_cgroup_init(void)
 int pf_cgroup_create_rule(int rule_id)
 {
     char path[PF_PATH_MAX];
-    rule_path(rule_id, path, sizeof(path));
+    if (rule_path(rule_id, path, sizeof(path)) < 0) return PF_ERR;
 
     if (mkdir(path, 0755) < 0 && errno != EEXIST) {
         pf_log_error("cgroup: mkdir(%s) failed: %s", path, strerror(errno));
@@ -88,13 +93,40 @@ int pf_cgroup_create_rule(int rule_id)
 int pf_cgroup_remove_rule(int rule_id)
 {
     char path[PF_PATH_MAX];
-    rule_path(rule_id, path, sizeof(path));
+    if (rule_path(rule_id, path, sizeof(path)) < 0) return PF_ERR;
 
-    if (rmdir(path) < 0 && errno != ENOENT) {
+    /* Try rmdir first — fast path when cgroup is empty */
+    if (rmdir(path) == 0) return PF_OK;
+    if (errno == ENOENT)  return PF_OK;
+    if (errno != EBUSY && errno != ENOTEMPTY) {
         pf_log_error("cgroup: rmdir(%s) failed: %s", path, strerror(errno));
         return PF_ERR;
     }
 
+    /* Cgroup still has PIDs — move them to the parent (base) cgroup so the
+     * kernel lets us rmdir. Reading cgroup.procs and writing each PID to
+     * PF_CGROUP_BASE/cgroup.procs is the documented v2 way to empty it. */
+    char procs[PF_PATH_MAX];
+    if (snprintf(procs, sizeof(procs), "%s/cgroup.procs", path) >= (int)sizeof(procs))
+        return PF_ERR;
+
+    FILE *fp = fopen(procs, "r");
+    if (fp) {
+        char pidbuf[32];
+        while (fgets(pidbuf, sizeof(pidbuf), fp)) {
+            /* trim newline */
+            size_t l = strlen(pidbuf);
+            if (l && pidbuf[l-1] == '\n') pidbuf[l-1] = '\0';
+            if (pidbuf[0]) write_file(PF_CGROUP_BASE "/cgroup.procs", pidbuf);
+        }
+        fclose(fp);
+    }
+
+    if (rmdir(path) < 0 && errno != ENOENT) {
+        pf_log_warn("cgroup: rmdir(%s) still failed after drain: %s",
+                     path, strerror(errno));
+        return PF_ERR;
+    }
     return PF_OK;
 }
 
@@ -109,7 +141,7 @@ int pf_cgroup_assign_pid(int rule_id, pid_t pid)
     char path[PF_PATH_MAX];
     char pidstr[32];
 
-    rule_path(rule_id, path, sizeof(path));
+    if (rule_path(rule_id, path, sizeof(path)) < 0) return PF_ERR;
     strncat(path, "/cgroup.procs", sizeof(path) - strlen(path) - 1);
 
     snprintf(pidstr, sizeof(pidstr), "%d", (int)pid);

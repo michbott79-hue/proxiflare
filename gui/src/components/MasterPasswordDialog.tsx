@@ -21,12 +21,15 @@ export default function MasterPasswordDialog({ onUnlocked }: Props) {
     try {
       const ok = await credentialsUnlock(password);
       if (ok) {
+        setPassword('');
         onUnlocked();
       } else {
+        setPassword('');
         setError('Invalid password');
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      setPassword('');
       setError(msg);
     } finally {
       setLoading(false);

@@ -4,7 +4,8 @@ import type { Proxy, Rule, Chain, DaemonStatus } from './types';
 // ── Proxy commands ──────────────────────────────────────────────
 
 export async function proxyList(): Promise<Proxy[]> {
-  return invoke<Proxy[]>('proxy_list');
+  const r = await invoke<unknown>('proxy_list');
+  return Array.isArray(r) ? (r as Proxy[]) : [];
 }
 
 export async function proxyAdd(proxy: Omit<Proxy, 'id' | 'health' | 'latency_ms'>): Promise<Proxy> {
@@ -44,7 +45,8 @@ export async function proxyTest(id: number): Promise<{ ok: boolean; latency_ms: 
 // ── Rule commands ───────────────────────────────────────────────
 
 export async function ruleList(): Promise<Rule[]> {
-  return invoke<Rule[]>('rule_list');
+  const r = await invoke<unknown>('rule_list');
+  return Array.isArray(r) ? (r as Rule[]) : [];
 }
 
 export async function ruleAdd(rule: Omit<Rule, 'id'>): Promise<Rule> {
@@ -88,7 +90,8 @@ export async function ruleReorder(ids: number[]): Promise<void> {
 // ── Chain commands ──────────────────────────────────────────────
 
 export async function chainList(): Promise<Chain[]> {
-  return invoke<Chain[]>('chain_list');
+  const r = await invoke<unknown>('chain_list');
+  return Array.isArray(r) ? (r as Chain[]) : [];
 }
 
 export async function chainAdd(chain: Omit<Chain, 'id'>): Promise<Chain> {

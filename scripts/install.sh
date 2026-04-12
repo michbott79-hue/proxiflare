@@ -63,6 +63,8 @@ cd "$PROJECT_DIR"
 # Install binaries
 info "Installing binaries..."
 install -m 755 daemon/build/proxiflare-daemon "$INSTALL_DIR/"
+# Emergency network recovery script (flushes nft/ip-rule/cgroup if daemon crashes)
+install -m 755 scripts/pf-panic.sh "$INSTALL_DIR/pf-panic"
 if [ -f "gui/src-tauri/target/release/proxiflare" ]; then
     install -m 755 gui/src-tauri/target/release/proxiflare "$INSTALL_DIR/"
 elif [ -f "gui/src-tauri/target/release/proxi-flare" ]; then

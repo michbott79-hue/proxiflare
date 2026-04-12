@@ -132,6 +132,11 @@ int pf_ssh_pool_init(pf_ssh_pool_t *pool)
 
     memset(pool, 0, sizeof(*pool));
 
+    if (pthread_mutex_init(&pool->pool_mutex, NULL) != 0) {
+        pf_log_error("ssh_pool_init: pthread_mutex_init failed");
+        return -1;
+    }
+
     /* Initialise all sock_fd fields to -1 (unallocated) */
     for (int i = 0; i < PF_MAX_PROXIES; i++)
         pool->sessions[i].sock_fd = -1;
@@ -154,6 +159,7 @@ void pf_ssh_pool_close(pf_ssh_pool_t *pool)
     if (!pool)
         return;
 
+    pthread_mutex_lock(&pool->pool_mutex);
     for (int i = 0; i < pool->count; i++) {
         pf_ssh_session_t *sess = &pool->sessions[i];
         if (sess->connected)
@@ -161,6 +167,8 @@ void pf_ssh_pool_close(pf_ssh_pool_t *pool)
     }
 
     pool->count = 0;
+    pthread_mutex_unlock(&pool->pool_mutex);
+    pthread_mutex_destroy(&pool->pool_mutex);
     libssh2_exit();
     pf_log_info("ssh_pool_close: pool closed");
 }
@@ -281,11 +289,15 @@ pf_ssh_session_t *pf_ssh_get_session(pf_ssh_pool_t *pool, const pf_proxy_t *prox
         return NULL;
     }
 
+    pthread_mutex_lock(&pool->pool_mutex);
+
     /* Search for an existing connected session for this proxy_id */
     for (i = 0; i < pool->count; i++) {
         pf_ssh_session_t *s = &pool->sessions[i];
-        if (s->proxy_id == (int)proxy->id && s->connected)
+        if (s->proxy_id == (int)proxy->id && s->connected) {
+            pthread_mutex_unlock(&pool->pool_mutex);
             return s;
+        }
         if (!s->connected && free_slot < 0)
             free_slot = i;
     }
@@ -295,6 +307,7 @@ pf_ssh_session_t *pf_ssh_get_session(pf_ssh_pool_t *pool, const pf_proxy_t *prox
         free_slot = pool->count;
     } else if (free_slot < 0) {
         pf_log_error("ssh_get_session: pool exhausted (%d sessions)", pool->count);
+        pthread_mutex_unlock(&pool->pool_mutex);
         return NULL;
     }
 
@@ -304,13 +317,16 @@ pf_ssh_session_t *pf_ssh_get_session(pf_ssh_pool_t *pool, const pf_proxy_t *prox
     memset(sess, 0, sizeof(*sess));
     sess->sock_fd = -1;
 
-    if (ssh_session_create(sess, proxy) < 0)
+    if (ssh_session_create(sess, proxy) < 0) {
+        pthread_mutex_unlock(&pool->pool_mutex);
         return NULL;
+    }
 
     /* Advance count only if using a brand-new slot at the end */
     if (free_slot == pool->count)
         pool->count++;
 
+    pthread_mutex_unlock(&pool->pool_mutex);
     return sess;
 }
 

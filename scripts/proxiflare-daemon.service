@@ -6,8 +6,12 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/proxiflare-daemon --foreground
 ExecReload=/bin/kill -HUP $MAINPID
+# Safety net: always flush nftables/ip-rule/cgroup state after daemon exit,
+# no matter the reason (crash, SIGKILL, hang). Prevents network freeze.
+ExecStopPost=-/usr/local/bin/pf-panic
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
 LimitNOFILE=65536
 
 [Install]

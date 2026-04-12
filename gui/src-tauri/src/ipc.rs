@@ -56,9 +56,11 @@ impl DaemonClient {
             .map_err(|e| format!("JSON serialize error: {}", e))?;
         msg.push('\n');
 
-        stream
-            .write_all(msg.as_bytes())
-            .map_err(|e| format!("Write error: {}", e))?;
+        if let Err(e) = stream.write_all(msg.as_bytes()) {
+            // Reset the cached stream so the next call reconnects from scratch.
+            *guard = None;
+            return Err(format!("Write error: {}", e));
+        }
 
         // Read response byte-by-byte until '\n' to avoid BufReader ownership issues
         let mut response_bytes: Vec<u8> = Vec::with_capacity(4096);

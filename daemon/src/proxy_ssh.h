@@ -4,6 +4,7 @@
 #include "proxiflare.h"
 #include <libssh2.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 /* Single SSH session */
 typedef struct {
@@ -13,10 +14,13 @@ typedef struct {
     bool connected;
 } pf_ssh_session_t;
 
-/* Pool of SSH sessions — one per SSH proxy, reused for multiple connections */
+/* Pool of SSH sessions — one per SSH proxy, reused for multiple connections.
+ * Accessed from tproxy accept threads, so pool_mutex serializes session
+ * creation, search and invalidation. */
 typedef struct {
     pf_ssh_session_t sessions[PF_MAX_PROXIES];
     int count;
+    pthread_mutex_t pool_mutex;
 } pf_ssh_pool_t;
 
 /* Init/cleanup pool */

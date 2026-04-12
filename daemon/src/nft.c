@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Internal helper: pipe nft commands via "nft -f -"
@@ -57,37 +58,31 @@ static int nft_delete_by_comment(const char *table_type, const char *table,
 
     char line[1024];
     int deleted = 0;
+    /* Collect all matching handles first, THEN delete — never close fp
+     * inside the fgets loop (that was a UAF on fp). */
+    int handles[256];
+    int handle_count = 0;
 
-    while (fgets(line, sizeof(line), fp)) {
-        /* Look for lines containing our comment marker */
+    while (fgets(line, sizeof(line), fp) && handle_count < (int)(sizeof(handles)/sizeof(handles[0]))) {
         if (!strstr(line, comment)) continue;
-
-        /* Extract handle: lines end with "# handle N" */
         const char *hstr = strstr(line, "# handle ");
         if (!hstr) continue;
 
         int handle = atoi(hstr + 9);
         if (handle <= 0) continue;
 
-        /* Queue up the delete — we'll run it after closing this popen */
+        handles[handle_count++] = handle;
+    }
+    pclose(fp);
+
+    /* Deletes run highest-handle-first so earlier handles stay valid */
+    for (int i = handle_count - 1; i >= 0; i--) {
         char del[256];
         snprintf(del, sizeof(del),
                  "delete rule %s %s %s handle %d\n",
-                 table_type, table, chain, handle);
-        /* Can't nest popen, so store and delete below */
-        /* For simplicity: close this fp, delete, re-open */
-        /* Actually, collect handles first, delete after */
-        pclose(fp);
-
-        nft_run(del);
-        deleted++;
-
-        /* Re-open and restart scan (handles may have shifted) */
-        fp = popen(cmd, "r");
-        if (!fp) return deleted > 0 ? PF_OK : PF_ERR;
+                 table_type, table, chain, handles[i]);
+        if (nft_run(del) == PF_OK) deleted++;
     }
-
-    pclose(fp);
 
     if (deleted > 0)
         pf_log_info("nft: deleted %d rules with comment '%s' from %s %s %s",
@@ -259,6 +254,19 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 {
     if (!dns_server || !dns_server[0]) {
         pf_log_error("nft: dns_leak: invalid server");
+        return PF_ERR;
+    }
+
+    /* Validate dns_server is a bare IPv4 or IPv6 literal BEFORE interpolating
+     * into an nft command. Rejects newlines, shell metacharacters, hostnames,
+     * and anything else that could break out of the `add rule` statement into
+     * `flush ruleset` or similar mischief. */
+    struct in_addr  v4;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET, dns_server, &v4) != 1 &&
+        inet_pton(AF_INET6, dns_server, &v6) != 1) {
+        pf_log_error("nft: dns_leak: dns_server '%s' is not a valid IP literal",
+                     dns_server);
         return PF_ERR;
     }
 

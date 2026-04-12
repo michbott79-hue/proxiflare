@@ -5,6 +5,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
+#include <pthread.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Limits
@@ -36,9 +37,10 @@ typedef struct {
     SSL_CTX     *server_ctx;   /* template — cert set per-connection via SNI callback */
     SSL_CTX     *client_ctx;   /* connects to real servers */
 
-    /* Dynamic cert cache */
+    /* Dynamic cert cache — protected by cache_lock (accessed from handshake threads) */
     pf_cert_cache_entry_t cache[PF_MITM_CERT_CACHE_SIZE];
     int          cache_count;
+    pthread_mutex_t cache_lock;
 
     int          enabled;      /* global on/off toggle */
 } pf_mitm_t;
@@ -61,7 +63,9 @@ int pf_mitm_init(pf_mitm_t *m);
 void pf_mitm_close(pf_mitm_t *m);
 
 /* Get or create a cert+key pair for the given domain.
- * Returns pointers into the cache (do NOT free). */
+ * Returns OWNED references — caller MUST call X509_free / EVP_PKEY_free
+ * (or transfer ownership to SSL via SSL_use_certificate / SSL_use_PrivateKey
+ * which up-refs again; then still free these refs). */
 int pf_mitm_get_cert(pf_mitm_t *m, const char *domain,
                      X509 **out_cert, EVP_PKEY **out_key);
 

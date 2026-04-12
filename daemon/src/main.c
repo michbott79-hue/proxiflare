@@ -64,6 +64,8 @@ struct pf_ctx {
     pf_tproxy_t    tproxy;
     pf_logger_t    logger;
     pf_ruleset_t  *ruleset;   /* heap-allocated: ~4.5MB (PF_MAX_RULES * sizeof(pf_rule_t)) */
+    pthread_rwlock_t ruleset_lock;  /* readers: match path; writer: reload */
+    pthread_mutex_t conns_lock;     /* serializes writes to tproxy.conns[] */
     pf_ssh_pool_t  ssh_pool;
     pf_stats_t     stats;
     pf_monitor_t   monitor;
@@ -74,6 +76,17 @@ struct pf_ctx {
 
 /* Single static instance — avoids putting ~6MB on the stack */
 static struct pf_ctx g_ctx;
+
+/* Thread-safe ruleset reload and lookup. Writers grab the write lock; the hot
+ * match path takes a read lock so multiple tproxy/monitor threads can match
+ * concurrently without blocking each other. */
+static int rules_reload_locked(struct pf_ctx *ctx)
+{
+    pthread_rwlock_wrlock(&ctx->ruleset_lock);
+    int rc = pf_rules_load(ctx->ruleset, &ctx->config);
+    pthread_rwlock_unlock(&ctx->ruleset_lock);
+    return rc;
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  * HTTP inspect ring buffer — stores intercepted request/response summaries
@@ -223,6 +236,30 @@ static void sig_handler(int signum)
     /* SIGHUP → reload is handled in the main loop via a flag */
 }
 
+/* Fatal signal handler: clean up nftables/ip-rule/cgroup before dying.
+ * Uses system() which is not strictly async-signal-safe, but: (a) we're
+ * already crashing, (b) the alternative is the user's network staying broken
+ * until reboot. The ExecStopPost in the systemd unit is the primary safety
+ * net; this is the belt to that suspender for standalone runs. */
+static volatile sig_atomic_t g_in_fatal = 0;
+static void sig_fatal(int signum)
+{
+    if (g_in_fatal) _exit(128 + signum); /* re-entry guard */
+    g_in_fatal = 1;
+
+    /* Best-effort cleanup — ignore return codes, we're dying anyway */
+    int _unused __attribute__((unused));
+    _unused = system("nft delete table inet proxiflare 2>/dev/null; "
+                     "nft delete table ip proxiflare_tproxy 2>/dev/null; "
+                     "ip rule del fwmark 1 lookup 100 2>/dev/null; "
+                     "ip route flush table 100 2>/dev/null");
+
+    /* Restore default handler and re-raise so we get the correct exit status
+     * and core dump behavior */
+    signal(signum, SIG_DFL);
+    raise(signum);
+}
+
 static volatile int g_reload = 0;
 
 static void sig_hup(int signum)
@@ -241,19 +278,34 @@ static void on_process_event(pid_t pid, const char *exe_path, bool is_exec, void
 
     if (is_exec) {
         if (!ctx->ruleset) return;
-        /* Match by full path first, then by basename for snap/flatpak apps */
-        const pf_rule_t *rule = pf_rules_match(ctx->ruleset, exe_path, NULL, NULL, 0);
+        /* Match by full path first, then by basename for snap/flatpak apps.
+         * Hold rdlock for the whole match+act block — the rule pointer is
+         * only valid while the ruleset isn't being reloaded under us. */
+        pthread_rwlock_rdlock(&ctx->ruleset_lock);
+        /* Process-level: ignore domain/ip/port filters — if ANY rule names
+         * this app, put the PID in the cgroup. Per-connection filtering is
+         * done in proxy_connect_for_tproxy against the actual SNI/destination. */
+        const pf_rule_t *rule = pf_rules_match_app_any(ctx->ruleset, exe_path);
         if (!rule || rule->action == PF_ACTION_DIRECT) {
             /* Extract basename and retry — handles snap paths like
              * /snap/firefox/8054/usr/lib/firefox/firefox matching "firefox" */
             const char *base = strrchr(exe_path, '/');
             base = base ? base + 1 : exe_path;
-            rule = pf_rules_match(ctx->ruleset, base, NULL, NULL, 0);
+            rule = pf_rules_match_app_any(ctx->ruleset, base);
         }
         if (rule && rule->action != PF_ACTION_DIRECT && rule->app_path[0]) {
-            pf_cgroup_assign_pid((int)rule->id, pid);
+            /* Copy scalar fields out while still under the lock — we may want
+             * to log/use them after releasing the rdlock. */
+            int      rule_id  = (int)rule->id;
+            uint32_t proxy_id = rule->proxy_id;
+            char     rname[64];
+            snprintf(rname, sizeof(rname), "%s", rule->name);
+            pthread_rwlock_unlock(&ctx->ruleset_lock);
+            pf_cgroup_assign_pid(rule_id, pid);
             pf_log_info("process_monitor: PID %d (%s) → rule '%s' (proxy_id=%u)",
-                        pid, exe_path, rule->name, rule->proxy_id);
+                        pid, exe_path, rname, proxy_id);
+        } else {
+            pthread_rwlock_unlock(&ctx->ruleset_lock);
         }
     } else {
         pf_cgroup_remove_pid(pid);
@@ -434,6 +486,11 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
             match_domain = dns_entry->domain;
     }
 
+    /* Acquire read lock: matching + iteration reads ruleset contents that
+     * may be rewritten by IPC reload at any time. Copy the chosen rule out
+     * before releasing so the rest of the function can work on stable data. */
+    pthread_rwlock_rdlock(&ctx->ruleset_lock);
+
     /* First try: match by domain/IP only (for rules without app constraint) */
     const pf_rule_t *rule = pf_rules_match(ctx->ruleset, NULL, match_domain,
                                            dst_ip, dst_port);
@@ -476,8 +533,15 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
         rule = best_specific ? best_specific : best_catchall;
     }
 
-    if (!rule || rule->action == PF_ACTION_DIRECT)
+    if (!rule || rule->action == PF_ACTION_DIRECT) {
+        pthread_rwlock_unlock(&ctx->ruleset_lock);
         return -1;
+    }
+
+    /* Copy the rule so the rest of the function doesn't depend on the lock */
+    pf_rule_t rule_copy = *rule;
+    pthread_rwlock_unlock(&ctx->ruleset_lock);
+    rule = &rule_copy;
 
     if (rule->action == PF_ACTION_BLOCK || rule->action == PF_ACTION_REJECT)
         return -2;
@@ -514,7 +578,13 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
                                      proxy.username, proxy.password);
                 break;
             case PF_PROXY_SSH:
-                fd = pf_ssh_connect(&ctx->ssh_pool, &proxy, target, dst_port);
+                /* SSH proxy yields a LIBSSH2_CHANNEL*, not a POSIX fd — the relay
+                 * path downstream expects a fd. Until the channel↔fd bridge
+                 * (socketpair + reader thread) is implemented, reject SSH proxies
+                 * here to avoid a type-confusion crash. */
+                pf_log_error("tproxy: SSH proxy '%s' not yet supported in relay path",
+                             proxy.name);
+                fd = -1;
                 break;
         }
 
@@ -775,7 +845,7 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                 }
 
                 /* reload ruleset */
-                pf_rules_load(ctx->ruleset, &ctx->config);
+                rules_reload_locked(ctx);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
@@ -787,8 +857,44 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         if (!params) {
             cJSON_AddStringToObject(resp, "error", "missing params");
         } else {
+            /* Partial-update: load current row from DB, then overlay only the
+             * JSON fields that are actually present. Without this, calling
+             * rule.edit with e.g. {"id":7,"enabled":false} would reset name,
+             * match_app, match_domain, action, proxy_id… all to empty/zero. */
             pf_rule_t r;
-            rule_from_json(&r, params);
+            cJSON *id_v = cJSON_GetObjectItem(params, "id");
+            int rid = id_v ? (int)id_v->valuedouble : 0;
+            int rule_loaded = (rid > 0 && pf_config_rule_get(&ctx->config, rid, &r) == PF_OK);
+            if (!rule_loaded) {
+                cJSON_AddStringToObject(resp, "error", "rule not found");
+            } else {
+            /* Overlay JSON fields onto the loaded rule (only if present) */
+            cJSON *v;
+            if ((v = cJSON_GetObjectItem(params, "name")) && v->valuestring)
+                snprintf(r.name, sizeof(r.name), "%s", v->valuestring);
+            if ((v = cJSON_GetObjectItem(params, "priority")))
+                r.priority = (int)v->valuedouble;
+            if ((v = cJSON_GetObjectItem(params, "match_app")) || (v = cJSON_GetObjectItem(params, "app_path")))
+                if (v->valuestring) snprintf(r.app_path, sizeof(r.app_path), "%s", v->valuestring);
+            if ((v = cJSON_GetObjectItem(params, "match_domain")) || (v = cJSON_GetObjectItem(params, "domain")))
+                if (v->valuestring) snprintf(r.domain, sizeof(r.domain), "%s", v->valuestring);
+            if ((v = cJSON_GetObjectItem(params, "match_ip")) || (v = cJSON_GetObjectItem(params, "ip_cidr")))
+                if (v->valuestring) snprintf(r.ip_cidr, sizeof(r.ip_cidr), "%s", v->valuestring);
+            if ((v = cJSON_GetObjectItem(params, "match_port")) || (v = cJSON_GetObjectItem(params, "dst_port"))) {
+                if (cJSON_IsString(v) && v->valuestring && v->valuestring[0])
+                    r.dst_port = (uint16_t)atoi(v->valuestring);
+                else if (cJSON_IsNumber(v))
+                    r.dst_port = (uint16_t)v->valuedouble;
+            }
+            if ((v = cJSON_GetObjectItem(params, "action")) && v->valuestring)
+                r.action = pf_action_from_str(v->valuestring);
+            if ((v = cJSON_GetObjectItem(params, "proxy_id")))
+                r.proxy_id = v->valuedouble > 0 ? (uint32_t)v->valuedouble : 0;
+            if ((v = cJSON_GetObjectItem(params, "chain_id")))
+                r.chain_id = v->valuedouble > 0 ? (uint32_t)v->valuedouble : 0;
+            if ((v = cJSON_GetObjectItem(params, "enabled")))
+                r.enabled = cJSON_IsTrue(v) ? 1 : 0;
+
             if (pf_config_rule_update(&ctx->config, &r) == PF_OK) {
                 /* Sync cgroup + nft mark for app-based rules */
                 if (r.app_path[0] && r.enabled && r.action != PF_ACTION_DIRECT) {
@@ -799,11 +905,12 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                     pf_nft_remove_cgroup_mark((int)r.id);
                     pf_cgroup_remove_rule((int)r.id);
                 }
-                pf_rules_load(ctx->ruleset, &ctx->config);
+                rules_reload_locked(ctx);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
             }
+            } /* end else rule_loaded */
         }
 
     /* ── rule.delete ─────────────────────────────────────────────────────── */
@@ -819,7 +926,7 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             pf_nft_remove_cgroup_mark(id);
 
             if (pf_config_rule_delete(&ctx->config, id) == PF_OK) {
-                pf_rules_load(ctx->ruleset, &ctx->config);
+                rules_reload_locked(ctx);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
@@ -927,7 +1034,7 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                     ok = 0;
             }
             if (ok) {
-                pf_rules_load(ctx->ruleset, &ctx->config);
+                rules_reload_locked(ctx);
                 cJSON_AddStringToObject(resp, "result", "ok");
             } else {
                 cJSON_AddStringToObject(resp, "error", "db error");
@@ -957,12 +1064,16 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
             const char *key = key_v->valuestring;
             const char *val = val_v->valuestring;
 
-            /* special: boot_enabled → systemctl enable/disable */
+            /* special: boot_enabled → systemctl enable/disable
+             * cmd is a static literal (not user input), but log & handle the
+             * system() return so failures are visible instead of silent. */
             if (strcmp(key, "boot_enabled") == 0) {
                 const char *cmd = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0)
                     ? "systemctl enable proxiflare.service >/dev/null 2>&1"
                     : "systemctl disable proxiflare.service >/dev/null 2>&1";
-                system(cmd);
+                int src = system(cmd);
+                if (src != 0)
+                    pf_log_warn("config.set boot_enabled: systemctl exited %d", src);
             }
 
             if (pf_config_set(&ctx->config, key, val) == PF_OK)
@@ -1343,12 +1454,15 @@ static void *tproxy_accept_thread(void *raw)
         close(cfd); return NULL;
     }
 
-    /* 4. Find a free slot in the connection table */
+    /* 4. Find a free slot in the connection table — serialize scan+claim
+     *    against concurrent accept threads and the main epoll cleanup. */
+    pthread_mutex_lock(&ctx->conns_lock);
     int slot = -1;
     for (int i = 0; i < PF_MAX_CONNECTIONS; i++) {
         if (!ctx->tproxy.conns[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        pthread_mutex_unlock(&ctx->conns_lock);
         pf_log_warn("tproxy: connection table full");
         close(proxy_fd); close(cfd); return NULL;
     }
@@ -1359,11 +1473,14 @@ static void *tproxy_accept_thread(void *raw)
     c->proxy_fd  = proxy_fd;
     c->dst_port  = dst_port;
     c->proxy_id  = -1;
-    c->active    = true;
+    c->active    = true;  /* claim slot under lock */
     c->is_tls    = is_tls;
     strncpy(c->dst_ip, dst_ip, sizeof(c->dst_ip) - 1);
+    c->dst_ip[sizeof(c->dst_ip) - 1] = '\0';
     strncpy(c->domain, domain, sizeof(c->domain) - 1);
+    c->domain[sizeof(c->domain) - 1] = '\0';
     ctx->tproxy.conn_count++;
+    pthread_mutex_unlock(&ctx->conns_lock);
 
     /* 5. MITM TLS handshake (if enabled) */
     if (ctx->mitm.enabled && ctx->mitm.ca_key && is_tls && domain[0]) {
@@ -1511,6 +1628,19 @@ int main(int argc, char *argv[])
         sigaction(SIGHUP,  &sa, NULL);
         /* ignore SIGPIPE — write() on closed sockets returns EPIPE */
         signal(SIGPIPE, SIG_IGN);
+
+        /* Fatal signals: clean up nft/ip-rule before dying so the user's
+         * network doesn't freeze until reboot. */
+        struct sigaction sf;
+        memset(&sf, 0, sizeof(sf));
+        sf.sa_handler = sig_fatal;
+        sigemptyset(&sf.sa_mask);
+        sf.sa_flags = SA_RESETHAND; /* one-shot, default kicks in after */
+        sigaction(SIGSEGV, &sf, NULL);
+        sigaction(SIGABRT, &sf, NULL);
+        sigaction(SIGBUS,  &sf, NULL);
+        sigaction(SIGFPE,  &sf, NULL);
+        sigaction(SIGQUIT, &sf, NULL);
     }
 
     /* ── 6. Init context ───────────────────────────────────────────────── */
@@ -1549,7 +1679,15 @@ int main(int argc, char *argv[])
         pf_config_close(&ctx->config);
         return 1;
     }
-    if (pf_rules_load(ctx->ruleset, &ctx->config) != PF_OK) {
+    if (pthread_rwlock_init(&ctx->ruleset_lock, NULL) != 0 ||
+        pthread_mutex_init(&ctx->conns_lock, NULL) != 0) {
+        fprintf(stderr, "[proxiflare] FATAL: lock init failed\n");
+        free(ctx->ruleset);
+        pf_logger_close(&ctx->logger);
+        pf_config_close(&ctx->config);
+        return 1;
+    }
+    if (rules_reload_locked(ctx) != PF_OK) {
         pf_log_warn("rules_load failed — starting with empty ruleset");
     } else {
         pf_log_info("Rules loaded: %d rules", ctx->ruleset->count);
@@ -1688,7 +1826,7 @@ int main(int argc, char *argv[])
             if (g_reload) {
                 g_reload = 0;
                 pf_log_info("SIGHUP received — reloading config and ruleset");
-                pf_rules_load(ctx->ruleset, &ctx->config);
+                rules_reload_locked(ctx);
             }
 
             int nev = epoll_wait(ctx->epoll_fd, events, MAX_EVENTS, 1000 /* ms */);
@@ -1776,18 +1914,33 @@ int main(int argc, char *argv[])
 
                     /* ── TPROXY: relay existing connection ─────────────── */
                     if (!found) {
+                        /* Scan under conns_lock to avoid racing accept_thread
+                         * writing new slots, but release before the relay
+                         * itself (which may block on network I/O). */
+                        int relay_slot = -1;
+                        int relay_client_fd = -1, relay_proxy_fd = -1;
+                        pthread_mutex_lock(&ctx->conns_lock);
                         for (int j = 0; j < PF_MAX_CONNECTIONS; j++) {
                             if (ctx->tproxy.conns[j].active &&
                                 (ctx->tproxy.conns[j].client_fd == fd ||
                                  ctx->tproxy.conns[j].proxy_fd  == fd))
                             {
-                                int rc = pf_tproxy_relay(&ctx->tproxy, j);
-                                if (rc < 0) {
-                                    epoll_del(ctx->epoll_fd, ctx->tproxy.conns[j].client_fd);
-                                    epoll_del(ctx->epoll_fd, ctx->tproxy.conns[j].proxy_fd);
-                                    pf_tproxy_close_conn(&ctx->tproxy, j);
-                                }
+                                relay_slot = j;
+                                relay_client_fd = ctx->tproxy.conns[j].client_fd;
+                                relay_proxy_fd  = ctx->tproxy.conns[j].proxy_fd;
                                 break;
+                            }
+                        }
+                        pthread_mutex_unlock(&ctx->conns_lock);
+
+                        if (relay_slot >= 0) {
+                            int rc = pf_tproxy_relay(&ctx->tproxy, relay_slot);
+                            if (rc < 0) {
+                                epoll_del(ctx->epoll_fd, relay_client_fd);
+                                epoll_del(ctx->epoll_fd, relay_proxy_fd);
+                                pthread_mutex_lock(&ctx->conns_lock);
+                                pf_tproxy_close_conn(&ctx->tproxy, relay_slot);
+                                pthread_mutex_unlock(&ctx->conns_lock);
                             }
                         }
                     }

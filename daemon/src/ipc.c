@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "ipc.h"
 
 #include <sys/socket.h>
@@ -89,6 +90,22 @@ int pf_ipc_accept(pf_ipc_t *ipc)
             perror("ipc: accept");
         return -1;
     }
+
+    /* Peer credential check — defense-in-depth against other local users.
+     * The daemon runs as root and executes privileged operations on request,
+     * so any local process that can open the socket is effectively trusted.
+     * Accept only root or regular users (uid >= 1000); reject system users
+     * (www-data, nobody, etc.) which have no business talking to us. */
+    struct ucred uc;
+    socklen_t uclen = sizeof(uc);
+    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &uc, &uclen) == 0) {
+        if (uc.uid != 0 && uc.uid < 1000) {
+            fprintf(stderr, "ipc: rejecting connection from uid=%u pid=%d\n",
+                    (unsigned)uc.uid, uc.pid);
+            close(cfd);
+            return -1;
+        }
+    } /* if getsockopt fails, fall through — not a security regression */
 
     if (ipc->client_count >= PF_MAX_CLIENTS) {
         /* Too many clients — reject */

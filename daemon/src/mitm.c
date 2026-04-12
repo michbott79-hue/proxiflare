@@ -9,7 +9,49 @@
 #include <openssl/rand.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <errno.h>
 #include <time.h>
+
+/* Cap TLS handshake to 5s — a stalled peer must not hold the MITM thread
+ * forever. Without this a client that never finishes ClientHello pins the
+ * handshake thread and, under load, the cache_lock it holds. */
+static void set_handshake_timeout(int fd, int seconds)
+{
+    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* Validate a domain string for safe inclusion in X.509 CN/SAN.
+ * Allows only [A-Za-z0-9.-] and length in [1, PF_DOMAIN_MAX].
+ * Returns 1 if safe, 0 otherwise. */
+static int domain_is_safe(const char *d)
+{
+    if (!d || !*d) return 0;
+    size_t n = strnlen(d, PF_DOMAIN_MAX + 1);
+    if (n > PF_DOMAIN_MAX) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if (!(isalnum(c) || c == '.' || c == '-' || c == '_')) return 0;
+    }
+    return 1;
+}
+
+/* Open a file for writing with mode 0600 enforced at creation time
+ * (closes the chmod race present in a naive fopen+chmod pattern). */
+static FILE *fopen_secure(const char *path, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0) return NULL;
+    if (fchmod(fd, mode) < 0) { close(fd); return NULL; }
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) { close(fd); return NULL; }
+    return fp;
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Internal helpers
@@ -84,10 +126,10 @@ int pf_mitm_generate_ca(void)
 
     /* Subject: CN=ProxiFlare CA */
     X509_NAME *name = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                                (const unsigned char *)"ProxiFlare CA", -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
-                                (const unsigned char *)"ProxiFlare", -1, -1, 0);
+    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                    (const unsigned char *)"ProxiFlare CA", -1, -1, 0) != 1) goto fail;
+    if (X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
+                                    (const unsigned char *)"ProxiFlare", -1, -1, 0) != 1) goto fail;
     X509_set_issuer_name(x509, name); /* self-signed */
 
     /* Set public key */
@@ -114,17 +156,17 @@ int pf_mitm_generate_ca(void)
     /* Sign with SHA-256 */
     if (!X509_sign(x509, pkey, EVP_sha256())) goto fail;
 
-    /* Write key */
-    fp = fopen(PF_MITM_CA_KEY_PATH, "w");
+    /* Write key — secure open (0600 enforced at creation, no chmod race) */
+    fp = fopen_secure(PF_MITM_CA_KEY_PATH, 0600);
     if (!fp) {
         pf_log_error("mitm: cannot write CA key to %s", PF_MITM_CA_KEY_PATH);
         goto fail;
     }
     if (!PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL)) goto fail;
     fclose(fp);
-    chmod(PF_MITM_CA_KEY_PATH, 0600);
+    fp = NULL;
 
-    /* Write cert */
+    /* Write cert (world-readable OK) */
     fp = fopen(PF_MITM_CA_CERT_PATH, "w");
     if (!fp) {
         pf_log_error("mitm: cannot write CA cert to %s", PF_MITM_CA_CERT_PATH);
@@ -187,8 +229,9 @@ static int generate_domain_cert(pf_mitm_t *m, const char *domain,
 
     /* Subject: CN=domain */
     X509_NAME *subj = X509_get_subject_name(cert);
-    X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
-                                (const unsigned char *)domain, -1, -1, 0);
+    if (X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
+                                    (const unsigned char *)domain, -1, -1, 0) != 1)
+        goto fail;
 
     /* Issuer: CA's subject name */
     X509_set_issuer_name(cert, X509_get_subject_name(m->ca_cert));
@@ -255,6 +298,11 @@ int pf_mitm_init(pf_mitm_t *m)
 {
     if (!m) return PF_ERR;
     memset(m, 0, sizeof(*m));
+
+    if (pthread_mutex_init(&m->cache_lock, NULL) != 0) {
+        pf_log_error("mitm: pthread_mutex_init failed");
+        return PF_ERR;
+    }
 
     if (!pf_mitm_ca_exists()) {
         pf_log_warn("mitm: CA not found — interception disabled. "
@@ -324,10 +372,14 @@ void pf_mitm_close(pf_mitm_t *m)
 {
     if (!m) return;
 
+    pthread_mutex_lock(&m->cache_lock);
     for (int i = 0; i < m->cache_count; i++) {
         if (m->cache[i].cert) X509_free(m->cache[i].cert);
         if (m->cache[i].key)  EVP_PKEY_free(m->cache[i].key);
     }
+    m->cache_count = 0;
+    pthread_mutex_unlock(&m->cache_lock);
+    pthread_mutex_destroy(&m->cache_lock);
 
     if (m->server_ctx) SSL_CTX_free(m->server_ctx);
     if (m->client_ctx) SSL_CTX_free(m->client_ctx);
@@ -344,22 +396,34 @@ void pf_mitm_close(pf_mitm_t *m)
 int pf_mitm_get_cert(pf_mitm_t *m, const char *domain,
                      X509 **out_cert, EVP_PKEY **out_key)
 {
-    if (!m || !domain || !m->ca_key) return PF_ERR;
+    if (!m || !domain || !m->ca_key || !out_cert || !out_key) return PF_ERR;
+    if (!domain_is_safe(domain)) {
+        pf_log_warn("mitm: rejecting unsafe domain for cert generation");
+        return PF_ERR;
+    }
 
-    /* Search cache */
+    pthread_mutex_lock(&m->cache_lock);
+
+    /* Search cache — hand out OWNED refs (caller must free) */
     for (int i = 0; i < m->cache_count; i++) {
         if (strcmp(m->cache[i].domain, domain) == 0) {
+            X509_up_ref(m->cache[i].cert);
+            EVP_PKEY_up_ref(m->cache[i].key);
             *out_cert = m->cache[i].cert;
             *out_key  = m->cache[i].key;
+            pthread_mutex_unlock(&m->cache_lock);
             return PF_OK;
         }
     }
 
-    /* Generate new cert */
+    /* Generate new cert (outside strict necessity but keeps lock held to avoid
+     * duplicate generation races — cert gen ~1ms with EC P-256). */
     X509 *cert = NULL;
     EVP_PKEY *key = NULL;
-    if (generate_domain_cert(m, domain, &cert, &key) != PF_OK)
+    if (generate_domain_cert(m, domain, &cert, &key) != PF_OK) {
+        pthread_mutex_unlock(&m->cache_lock);
         return PF_ERR;
+    }
 
     /* Add to cache — evict oldest if full */
     int slot;
@@ -379,8 +443,13 @@ int pf_mitm_get_cert(pf_mitm_t *m, const char *domain,
     m->cache[slot].key     = key;
     m->cache[slot].created = time(NULL);
 
+    /* Hand out OWNED references — caller must free. This survives concurrent
+     * eviction because X509/EVP_PKEY are ref-counted in OpenSSL. */
+    X509_up_ref(cert);
+    EVP_PKEY_up_ref(key);
     *out_cert = cert;
     *out_key  = key;
+    pthread_mutex_unlock(&m->cache_lock);
     return PF_OK;
 }
 
@@ -392,7 +461,7 @@ SSL *pf_mitm_wrap_client(pf_mitm_t *m, int client_fd, const char *domain)
 {
     if (!m || !m->server_ctx || !m->ca_key || client_fd < 0) return NULL;
 
-    /* Get/generate cert for this domain */
+    /* Get/generate cert for this domain — OWNED refs (must free) */
     X509 *cert = NULL;
     EVP_PKEY *key = NULL;
     if (pf_mitm_get_cert(m, domain, &cert, &key) != PF_OK) {
@@ -403,18 +472,24 @@ SSL *pf_mitm_wrap_client(pf_mitm_t *m, int client_fd, const char *domain)
     SSL *ssl = SSL_new(m->server_ctx);
     if (!ssl) {
         log_ssl_errors("SSL_new server");
+        X509_free(cert); EVP_PKEY_free(key);
         return NULL;
     }
 
-    /* Set this connection's cert + key */
+    /* SSL_use_* up-refs internally; we still drop our refs below. */
     if (SSL_use_certificate(ssl, cert) != 1 ||
         SSL_use_PrivateKey(ssl, key) != 1) {
         log_ssl_errors("SSL_use_certificate/key");
         SSL_free(ssl);
+        X509_free(cert); EVP_PKEY_free(key);
         return NULL;
     }
+    /* Drop our owned refs — SSL holds its own via up-ref in SSL_use_*. */
+    X509_free(cert);
+    EVP_PKEY_free(key);
 
     SSL_set_fd(ssl, client_fd);
+    set_handshake_timeout(client_fd, 5);
 
     /* Do the TLS handshake (server-side accept) */
     int ret = SSL_accept(ssl);
@@ -445,6 +520,7 @@ SSL *pf_mitm_wrap_server(pf_mitm_t *m, int proxy_fd, const char *domain)
     }
 
     SSL_set_fd(ssl, proxy_fd);
+    set_handshake_timeout(proxy_fd, 5);
 
     /* Set SNI hostname */
     if (domain && domain[0])

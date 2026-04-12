@@ -272,3 +272,16 @@ const pf_rule_t *pf_rules_match(const pf_ruleset_t *rs,
     }
     return NULL;
 }
+
+const pf_rule_t *pf_rules_match_app_any(const pf_ruleset_t *rs,
+                                         const char *app_path)
+{
+    if (!rs || !app_path) return NULL;
+    for (int i = 0; i < rs->count; i++) {
+        const pf_rule_t *r = &rs->rules[i];
+        if (!r->enabled) continue;
+        if (!r->app_path[0]) continue;
+        if (pf_match_app(r->app_path, app_path)) return r;
+    }
+    return NULL;
+}

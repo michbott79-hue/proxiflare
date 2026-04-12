@@ -180,6 +180,13 @@ int pf_monitor_process(pf_monitor_t *mon)
         if (nlh->nlmsg_type == NLMSG_ERROR || nlh->nlmsg_type == NLMSG_NOOP)
             continue;
 
+        /* Only trust messages from the kernel (pid 0). A malicious local
+         * process could unicast a crafted netlink datagram to our socket; in
+         * practice Linux won't deliver user-origin connector messages on
+         * NETLINK_CONNECTOR, but defense-in-depth. */
+        if (nlh->nlmsg_pid != 0)
+            continue;
+
         if ((size_t)NLMSG_PAYLOAD(nlh, 0) < sizeof(struct cn_msg))
             continue;
 

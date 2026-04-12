@@ -196,10 +196,13 @@ static int dns_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
         goto accept;
 
     for (uint16_t i = 0; i < ancount && ptr < end; i++) {
-        /* Skip owner name (may be compressed) */
+        /* Skip owner name (may be compressed). Bound every pointer move so
+         * a crafted response can't walk past `end`. */
+        bool broken = false;
         while (ptr < end) {
             uint8_t b = *ptr;
             if ((b & 0xC0) == 0xC0) {
+                if (ptr + 2 > end) { broken = true; break; }
                 ptr += 2;
                 break;
             }
@@ -207,14 +210,18 @@ static int dns_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
                 ptr++;
                 break;
             }
+            if (ptr + 1 + b > end) { broken = true; break; }
             ptr += b + 1;
         }
+        if (broken) break;
 
         /* Need TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes */
         if (ptr + 10 > end)
             break;
 
         uint16_t rtype    = (uint16_t)((ptr[0] << 8) | ptr[1]);
+        uint32_t rttl     = ((uint32_t)ptr[4] << 24) | ((uint32_t)ptr[5] << 16) |
+                            ((uint32_t)ptr[6] << 8)  |  (uint32_t)ptr[7];
         uint16_t rdlength = (uint16_t)((ptr[8] << 8) | ptr[9]);
         ptr += 10;
 
@@ -236,9 +243,13 @@ static int dns_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
                 if (slot >= 0) {
                     pf_dns_entry_t *e = &dns->cache[slot];
                     if (e->used && strcasecmp(e->domain, domain) == 0) {
-                        /* Update IP on existing entry */
+                        /* Update IP on existing entry. Honor the TTL the
+                         * authoritative server returned (capped at PF_DNS_TTL
+                         * so we never cache longer than intended). */
                         strncpy(e->resolved_ip, ip_str, sizeof(e->resolved_ip) - 1);
-                        e->expires = time(NULL) + PF_DNS_TTL;
+                        uint32_t ttl = rttl < (uint32_t)PF_DNS_TTL ? rttl : (uint32_t)PF_DNS_TTL;
+                        if (ttl < 30) ttl = 30;  /* floor: avoid thundering herd on TTL=0 */
+                        e->expires = time(NULL) + (time_t)ttl;
                     } else {
                         /* Insert fresh entry with rule match */
                         const pf_rule_t *rule = pf_rules_match(

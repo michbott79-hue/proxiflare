@@ -31,6 +31,16 @@ const pf_rule_t *pf_rules_match(const pf_ruleset_t *rs,
                                  const char *dst_ip,
                                  int         dst_port);
 
+/*
+ * Process-level match: returns the first enabled rule whose app_path matches,
+ * IGNORING domain/ip/port filters. Used at exec() time to decide whether to
+ * put a PID in the cgroup. Domain/IP/port filtering happens later in TPROXY.
+ * Without this, a rule like app=firefox + domain=*.dazn.com would never put
+ * firefox in the cgroup, so TPROXY would never see its traffic.
+ */
+const pf_rule_t *pf_rules_match_app_any(const pf_ruleset_t *rs,
+                                         const char *app_path);
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * Individual pattern matchers (exported for unit testing)
  *

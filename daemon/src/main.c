@@ -840,6 +840,10 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                 if (r.app_path[0] && r.action != PF_ACTION_DIRECT) {
                     pf_cgroup_create_rule(new_id);
                     pf_nft_add_cgroup_mark(new_id);
+                    /* Hot-assign already-running matching PIDs so the user
+                     * doesn't have to restart the target app after adding
+                     * the rule. */
+                    pf_cgroup_assign_running_pids(new_id, r.app_path);
                     pf_log_info("rule.add: cgroup+nft mark set up for rule_%d (app=%s)",
                                 new_id, r.app_path);
                 }
@@ -900,6 +904,10 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                 if (r.app_path[0] && r.enabled && r.action != PF_ACTION_DIRECT) {
                     pf_cgroup_create_rule((int)r.id);
                     pf_nft_add_cgroup_mark((int)r.id);
+                    /* Re-sync: pick up running PIDs that match the (possibly
+                     * changed) app_path. pf_cgroup_assign_pid is a no-op if
+                     * the PID is already in the cgroup. */
+                    pf_cgroup_assign_running_pids((int)r.id, r.app_path);
                 } else {
                     /* Disabled or no app — remove cgroup mark */
                     pf_nft_remove_cgroup_mark((int)r.id);

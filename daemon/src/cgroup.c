@@ -156,6 +156,64 @@ int pf_cgroup_assign_pid(int rule_id, pid_t pid)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * pf_cgroup_assign_running_pids
+ *
+ * Scan /proc and assign every running PID whose /proc/N/exe target matches
+ * app_pattern (full path OR basename) to rule_id's cgroup. Used when a rule
+ * is added or re-enabled so apps already running (e.g. a Firefox window left
+ * open by the user) get intercepted without needing to be restarted.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+#include "rules.h" /* for pf_match_app */
+
+int pf_cgroup_assign_running_pids(int rule_id, const char *app_pattern)
+{
+    if (!app_pattern || !*app_pattern) return 0;
+
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        pf_log_error("cgroup: opendir(/proc) failed: %s", strerror(errno));
+        return 0;
+    }
+
+    int assigned = 0;
+    struct dirent *ent;
+    while ((ent = readdir(proc)) != NULL) {
+        /* PID dirs are all-digits */
+        const char *p = ent->d_name;
+        if (!*p) continue;
+        for (const char *c = p; *c; c++) if (*c < '0' || *c > '9') { p = NULL; break; }
+        if (!p) continue;
+
+        char exe_link[64], exe_path[PF_PATH_MAX];
+        snprintf(exe_link, sizeof(exe_link), "/proc/%s/exe", ent->d_name);
+        ssize_t n = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (n <= 0) continue;          /* kernel thread or permission denied */
+        exe_path[n] = '\0';
+
+        /* Try full path, then basename — mirrors on_process_event's
+         * fallback logic so snap paths like /snap/firefox/X/.../firefox
+         * match a rule configured as /snap/bin/firefox (the launcher). */
+        if (!pf_match_app(app_pattern, exe_path)) {
+            const char *base = strrchr(exe_path, '/');
+            base = base ? base + 1 : exe_path;
+            const char *pat_base = strrchr(app_pattern, '/');
+            pat_base = pat_base ? pat_base + 1 : app_pattern;
+            if (strcmp(base, pat_base) != 0) continue;
+        }
+
+        pid_t pid = (pid_t)atoi(ent->d_name);
+        if (pf_cgroup_assign_pid(rule_id, pid) == PF_OK) assigned++;
+    }
+    closedir(proc);
+
+    if (assigned > 0)
+        pf_log_info("cgroup: assigned %d already-running PID(s) matching '%s' to rule_%d",
+                    assigned, app_pattern, rule_id);
+    return assigned;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * pf_cgroup_remove_pid
  *
  * Scans all rule_* cgroup dirs.  If the PID is found in cgroup.procs,

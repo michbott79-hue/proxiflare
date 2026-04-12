@@ -26,14 +26,20 @@ export default function App() {
   // For dev mode: skip master password if daemon is not connected at all
   const showPasswordDialog = daemon.connected && !daemon.unlocked;
 
+  /* reconnectKey: bumps when daemon transitions disconnected→connected.
+   * Passed as a React key so each page component unmounts+remounts,
+   * which re-runs all its useEffect(load) hooks with fresh data.
+   * This is simpler than prop-drilling a refresh signal into every page. */
+  const reconnectKey = daemon.reconnectCount;
+
   function renderPage() {
     switch (activeTab) {
-      case 'proxies': return <Proxies />;
-      case 'rules': return <Rules />;
-      case 'chains': return <Chains />;
-      case 'log': return <Log />;
-      case 'inspect': return <Inspect />;
-      case 'settings': return <Settings daemon={daemon} />;
+      case 'proxies': return <Proxies key={reconnectKey} />;
+      case 'rules': return <Rules key={reconnectKey} />;
+      case 'chains': return <Chains key={reconnectKey} />;
+      case 'log': return <Log key={reconnectKey} />;
+      case 'inspect': return <Inspect key={reconnectKey} />;
+      case 'settings': return <Settings key={reconnectKey} daemon={daemon} />;
     }
   }
 

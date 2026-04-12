@@ -6,8 +6,9 @@
 set +e
 
 echo "[pf-panic] killing daemon..."
-systemctl stop proxiflare-daemon 2>/dev/null
-pkill -9 -f proxiflare-daemon
+# Don't call systemctl stop — this script runs as systemd ExecStopPost,
+# calling systemctl would deadlock. Just kill any remaining daemon process.
+pkill -9 -f proxiflare-daemon 2>/dev/null
 
 echo "[pf-panic] removing nftables proxiflare table..."
 nft delete table inet proxiflare 2>/dev/null

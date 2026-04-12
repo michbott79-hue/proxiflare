@@ -7,6 +7,10 @@ interface DaemonState {
   connected: boolean;
   unlocked: boolean;
   error: string | null;
+  /* Bumps every time the daemon transitions from disconnected→connected.
+   * Page components use this as a useEffect dep to refetch their data
+   * after the daemon has been restarted. */
+  reconnectCount: number;
 }
 
 const DEFAULT_STATUS: DaemonStatus = {
@@ -23,6 +27,7 @@ export function useDaemon() {
     connected: false,
     unlocked: false,
     error: null,
+    reconnectCount: 0,
   });
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Once unlocked in this session, stay unlocked
@@ -35,27 +40,31 @@ export function useDaemon() {
       // If daemon says crypto is unlocked, or we already unlocked this session
       const daemonUnlocked = (s as any).crypto_unlocked === true;
       if (daemonUnlocked) unlockedRef.current = true;
-      setState({
+      setState(prev => ({
         status: s,
         connected: true,
         unlocked: unlockedRef.current,
         error: null,
-      });
+        /* transition disconnected→connected: bump so pages refetch */
+        reconnectCount: prev.connected ? prev.reconnectCount : prev.reconnectCount + 1,
+      }));
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes('locked') || msg.includes('Locked')) {
-        setState({
+        setState(prev => ({
           status: DEFAULT_STATUS,
           connected: true,
           unlocked: unlockedRef.current,
           error: null,
-        });
+          reconnectCount: prev.connected ? prev.reconnectCount : prev.reconnectCount + 1,
+        }));
       } else {
         setState(prev => ({
           status: DEFAULT_STATUS,
           connected: false,
           unlocked: prev.unlocked,
           error: msg,
+          reconnectCount: prev.reconnectCount,
         }));
       }
     }

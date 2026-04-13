@@ -534,11 +534,27 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     }
 
     if (!rule || rule->action == PF_ACTION_DIRECT) {
-        /* Copy the rule name/id out before unlocking — we want it in the
-         * log entry. When rule==NULL (no match at all) we emit "direct"
-         * without a rule name. */
+        /* Copy the rule name + app_path out before unlocking — we want them
+         * in the log entry. When rule==NULL (no match at all) we infer the
+         * app from the first enabled app-based rule (the connection arrived
+         * here via TPROXY so its source is in SOME rule's cgroup). */
         char direct_rule_name[64] = "";
-        if (rule) snprintf(direct_rule_name, sizeof(direct_rule_name), "%s", rule->name);
+        char direct_app[PF_PATH_MAX] = "";
+        if (rule) {
+            snprintf(direct_rule_name, sizeof(direct_rule_name), "%s", rule->name);
+            snprintf(direct_app, sizeof(direct_app), "%s", rule->app_path);
+        } else {
+            /* Heuristic: packet is TPROXY'd so its source process must be in
+             * some proxiflare cgroup. Pick the first enabled app-based rule
+             * as a best-effort label. */
+            for (int i = 0; i < ctx->ruleset->count; i++) {
+                const pf_rule_t *r2 = &ctx->ruleset->rules[i];
+                if (r2->enabled && r2->app_path[0]) {
+                    snprintf(direct_app, sizeof(direct_app), "%s", r2->app_path);
+                    break;
+                }
+            }
+        }
         pthread_rwlock_unlock(&ctx->ruleset_lock);
 
         /* Log direct pass-through so the user can SEE that the app is
@@ -552,7 +568,7 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
 
         cJSON *event = cJSON_CreateObject();
         cJSON_AddNumberToObject(event, "ts", (double)time(NULL));
-        cJSON_AddStringToObject(event, "app", "");
+        cJSON_AddStringToObject(event, "app", direct_app);
         cJSON_AddStringToObject(event, "rule", direct_rule_name);
         cJSON_AddStringToObject(event, "proxy", "direct");
         cJSON_AddNumberToObject(event, "proxy_id", 0);

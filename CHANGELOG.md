@@ -9,7 +9,10 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
-## [Unreleased] — 2026-04-14
+## [0.2.0-alpha] — 2026-04-14
+
+Cumulative release covering two sessions of work on lifecycle, DNS privacy,
+and capture quality.
 
 ### Added — HTTP capture: decompression + noise filters + bigger ring
 - **Body decompression on capture** (`daemon/src/body_decode.{c,h}`): the captured
@@ -38,6 +41,15 @@ Format follows [Semantic Versioning](https://semver.org/):
   succeeded, so a stray unhandled codec is visible rather than silent garbage.
 - GUI in-memory cap aligned with the daemon ring (500 → 5000).
 
+### Added — Inspect UI polish
+- Native `<select>` dropdowns replaced with dark-theme custom dropdowns
+  (Linux WebKit renders native selects as bright-white, breaking the dark
+  UI). Matches the existing pattern used in Settings → DNS preset dropdown.
+- **Daemon-restart detection** in the Inspect poll: if the returned list
+  contains any `seq` lower than the GUI's last seen seq, assume the daemon
+  restarted (seq resets to 1) and refresh state from scratch — otherwise
+  the GUI would silently show "0 entries" while the daemon's ring is full.
+
 ### Why not HTTP/2 native
 Our MITM forces ALPN=http/1.1 which covers ~85% of real-world traffic. Native
 h2 parsing needs nghttp2 + stream multiplexing + HPACK — ~3-5 days of work for
@@ -45,9 +57,7 @@ the remaining 15% (mostly gRPC and a few sites). Deferred until requested.
 
 ---
 
-## [Unreleased] — 2026-04-13
-
-### Added
+### Added — 2026-04-13 (folded into 0.2.0-alpha)
 - **GUI daemon auto-lifecycle**: opening the GUI starts `proxiflare-daemon` via systemd;
   closing the window (or SIGTERM/SIGINT/SIGHUP) cleanly stops it. Tracks whether the
   GUI started the daemon (via `systemctl is-active` check) so a pre-running daemon is

@@ -77,9 +77,41 @@ export default function Inspect() {
   const [filter, setFilter] = useState('');
   const [ctypeFilter,  setCtypeFilter]  = useState<CtypeFilter>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [ctypeOpen,    setCtypeOpen]    = useState(false);
+  const [statusOpen,   setStatusOpen]   = useState(false);
   const [toggling, setToggling] = useState(false);
+  const ctypeRef  = useRef<HTMLDivElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
   const seqRef = useRef(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /* Close dropdowns on outside click */
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ctypeRef.current  && !ctypeRef.current.contains(e.target as Node))  setCtypeOpen(false);
+      if (statusRef.current && !statusRef.current.contains(e.target as Node)) setStatusOpen(false);
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  const CTYPE_OPTIONS: { value: CtypeFilter; label: string }[] = [
+    { value: 'all',   label: 'all types' },
+    { value: 'json',  label: 'JSON' },
+    { value: 'html',  label: 'HTML' },
+    { value: 'xml',   label: 'XML' },
+    { value: 'text',  label: 'text/*' },
+    { value: 'other', label: 'other' },
+  ];
+  const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
+    { value: 'all', label: 'all status' },
+    { value: '2xx', label: '2xx' },
+    { value: '3xx', label: '3xx' },
+    { value: '4xx', label: '4xx' },
+    { value: '5xx', label: '5xx' },
+  ];
+  const ctypeLabel  = CTYPE_OPTIONS.find(o => o.value === ctypeFilter)!.label;
+  const statusLabel = STATUS_OPTIONS.find(o => o.value === statusFilter)!.label;
 
   const loadStatus = useCallback(async () => {
     try {
@@ -92,6 +124,17 @@ export default function Inspect() {
     try {
       const raw = await api.inspectList(seqRef.current);
       if (Array.isArray(raw) && raw.length > 0) {
+        /* Daemon-restart detection: if any returned seq is LESS than what we
+         * already saw, the daemon restarted (seq resets to 1). Wipe local
+         * state and start over from seq 0 so nothing is silently skipped. */
+        const minSeq = Math.min(...raw.map((e: InspectEntry) => e.seq || 0));
+        if (seqRef.current > 0 && minSeq < seqRef.current) {
+          seqRef.current = 0;
+          setEntries(raw);
+          const maxSeq = Math.max(...raw.map((e: InspectEntry) => e.seq || 0));
+          seqRef.current = maxSeq;
+          return;
+        }
         setEntries(prev => {
           const merged = [...prev, ...raw];
           /* Keep the GUI in sync with the daemon ring (5000 entries).
@@ -206,32 +249,63 @@ export default function Inspect() {
           className="w-64 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
         />
 
-        <select
-          value={ctypeFilter}
-          onChange={e => setCtypeFilter(e.target.value as CtypeFilter)}
-          className="rounded-md border border-[#2d3348] bg-[#232733] px-2 py-1.5 text-xs text-[#e2e8f0] outline-none focus:border-[#6366f1]"
-          title="Filter by response Content-Type"
-        >
-          <option value="all">all types</option>
-          <option value="json">JSON</option>
-          <option value="html">HTML</option>
-          <option value="xml">XML</option>
-          <option value="text">text/*</option>
-          <option value="other">other</option>
-        </select>
+        {/* Content-Type custom dropdown */}
+        <div className="relative" ref={ctypeRef}>
+          <button
+            onClick={() => { setCtypeOpen(v => !v); setStatusOpen(false); }}
+            title="Filter by response Content-Type"
+            className="flex items-center gap-2 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] transition-colors hover:border-[#6366f1]"
+          >
+            <span>{ctypeLabel}</span>
+            <svg className="h-3 w-3 text-[#64748b]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+          {ctypeOpen && (
+            <div className="absolute left-0 z-50 mt-1 min-w-[140px] rounded-md border border-[#2d3348] bg-[#1a1d27] py-1 shadow-lg">
+              {CTYPE_OPTIONS.map(opt => (
+                <button
+                  key={opt.value}
+                  onClick={() => { setCtypeFilter(opt.value); setCtypeOpen(false); }}
+                  className={`flex w-full items-center px-3 py-1.5 text-left text-xs transition-colors hover:bg-[#2d3348] ${
+                    ctypeFilter === opt.value ? 'text-[#6366f1]' : 'text-[#e2e8f0]'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
-        <select
-          value={statusFilter}
-          onChange={e => setStatusFilter(e.target.value as StatusFilter)}
-          className="rounded-md border border-[#2d3348] bg-[#232733] px-2 py-1.5 text-xs text-[#e2e8f0] outline-none focus:border-[#6366f1]"
-          title="Filter by HTTP status class"
-        >
-          <option value="all">all status</option>
-          <option value="2xx">2xx</option>
-          <option value="3xx">3xx</option>
-          <option value="4xx">4xx</option>
-          <option value="5xx">5xx</option>
-        </select>
+        {/* Status class custom dropdown */}
+        <div className="relative" ref={statusRef}>
+          <button
+            onClick={() => { setStatusOpen(v => !v); setCtypeOpen(false); }}
+            title="Filter by HTTP status class"
+            className="flex items-center gap-2 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] transition-colors hover:border-[#6366f1]"
+          >
+            <span>{statusLabel}</span>
+            <svg className="h-3 w-3 text-[#64748b]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+          {statusOpen && (
+            <div className="absolute left-0 z-50 mt-1 min-w-[120px] rounded-md border border-[#2d3348] bg-[#1a1d27] py-1 shadow-lg">
+              {STATUS_OPTIONS.map(opt => (
+                <button
+                  key={opt.value}
+                  onClick={() => { setStatusFilter(opt.value); setStatusOpen(false); }}
+                  className={`flex w-full items-center px-3 py-1.5 text-left text-xs transition-colors hover:bg-[#2d3348] ${
+                    statusFilter === opt.value ? 'text-[#6366f1]' : 'text-[#e2e8f0]'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
         <button
           onClick={() => { setEntries([]); seqRef.current = 0; }}

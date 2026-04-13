@@ -174,11 +174,22 @@ int pf_nft_cleanup(void)
 
 int pf_nft_setup_dns_redirect(void)
 {
-    if (nft_run("add rule inet proxiflare output udp dport 53 queue num 0 comment \"pf_dns_nfqueue\"\n") != PF_OK) {
+    /* Intercept DNS queries ONLY from processes inside proxiflare cgroups,
+     * not system-wide. Without this scope, any hiccup in the daemon's NFQUEUE
+     * consumer (stall, crash, restart) kills DNS for the entire box (apt,
+     * ssh, systemd-resolved, everything) — "rete bloccata" symptom Mich
+     * observed even after the safety-net commits.
+     *
+     * level 1 "proxiflare" matches any sub-cgroup (rule_N), so this still
+     * populates the IP→domain cache used for SNI-less rule matching. */
+    if (nft_run("add rule inet proxiflare output "
+                "socket cgroupv2 level 1 \"proxiflare\" "
+                "udp dport 53 queue num 0 bypass "
+                "comment \"pf_dns_nfqueue\"\n") != PF_OK) {
         pf_log_error("nft: failed to add DNS NFQUEUE rule");
         return PF_ERR;
     }
-    pf_log_info("nft: DNS redirect to NFQUEUE 0 installed");
+    pf_log_info("nft: DNS NFQUEUE installed (scope: proxiflare cgroup only, bypass on failure)");
     return PF_OK;
 }
 

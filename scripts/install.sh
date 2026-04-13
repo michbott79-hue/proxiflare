@@ -82,8 +82,13 @@ install -d -m 755 "$LOG_DIR"
 install -m 644 scripts/proxiflare-daemon.service /etc/systemd/system/
 systemctl daemon-reload
 
-# Install polkit policy
+# Install polkit policy (action descriptor)
 install -m 644 scripts/com.proxiflare.policy /usr/share/polkit-1/actions/ 2>/dev/null || true
+
+# Install polkit rule (authorizes members of `sudo` group to start/stop
+# proxiflare-daemon without a password prompt — required for GUI auto-start/stop)
+install -d -m 755 /etc/polkit-1/rules.d
+install -m 644 scripts/50-proxiflare.rules /etc/polkit-1/rules.d/ 2>/dev/null || true
 
 # Install desktop entry
 cat > /usr/share/applications/proxiflare.desktop << 'DESKTOP'

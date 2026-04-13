@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Proxy, ProxyType, HealthStatus } from '../lib/types';
 import * as api from '../lib/api';
+import ImportProviderModal from '../components/ImportProviderModal';
 
 const PROXY_TYPES: ProxyType[] = ['socks5', 'socks4', 'http', 'ssh'];
 
@@ -38,6 +39,7 @@ const EMPTY_PROXY: Partial<Proxy> = {
 export default function Proxies() {
   const [proxies, setProxies] = useState<Proxy[]>([]);
   const [modal, setModal] = useState<ModalState>({ open: false, proxy: null });
+  const [importOpen, setImportOpen] = useState(false);
   const [testing, setTesting] = useState<Record<number, boolean>>({});
   const [testResults, setTestResults] = useState<Record<number, { ok: boolean; latency_ms: number | null; error?: string }>>({});
   const [saving, setSaving] = useState(false);
@@ -128,7 +130,10 @@ export default function Proxies() {
         >
           Add Proxy
         </button>
-        <button className="rounded-md border border-[#2d3348] bg-[#232733] px-4 py-2 text-sm text-[#64748b] transition-colors hover:text-[#e2e8f0]">
+        <button
+          onClick={() => setImportOpen(true)}
+          className="rounded-md border border-[#2d3348] bg-[#232733] px-4 py-2 text-sm text-[#94a3b8] transition-colors hover:border-[#6366f1] hover:text-[#e2e8f0]"
+        >
           Import
         </button>
         <button className="rounded-md border border-[#2d3348] bg-[#232733] px-4 py-2 text-sm text-[#64748b] transition-colors hover:text-[#e2e8f0]">
@@ -371,6 +376,13 @@ export default function Proxies() {
             </div>
           </div>
         </div>
+      )}
+
+      {importOpen && (
+        <ImportProviderModal
+          onClose={() => setImportOpen(false)}
+          onDone={() => { load(); }}
+        />
       )}
     </div>
   );

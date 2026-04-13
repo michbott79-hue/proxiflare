@@ -1,0 +1,14 @@
+// ProxiFlare — allow members of the `sudo` group to start/stop/restart
+// the proxiflare-daemon systemd unit without a password prompt.
+// This enables the GUI to manage its backend lifecycle seamlessly.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "proxiflare-daemon.service" &&
+        subject.isInGroup("sudo") && subject.active) {
+        var verb = action.lookup("verb");
+        if (verb == "start" || verb == "stop" || verb == "restart" ||
+            verb == "reload" || verb == "reload-or-restart") {
+            return polkit.Result.YES;
+        }
+    }
+});

@@ -83,3 +83,12 @@ sudo pkill proxiflare-daemon; sudo /usr/local/bin/proxiflare-daemon --foreground
 
 ## Proxy di Mich (6 residenziali)
 Credenziali in `mem_creds("general")`. Paesi: FR, RS, BR, HR, CH, DE.
+
+# Ruflo Integration (solo questo progetto)
+Ruflo è installato in `.claude/` + `.claude-flow/` di questo progetto.
+- MCP locali (in `.mcp.json`): claude-flow, ruv-swarm, flow-nexus — `autoStart: false`
+- Avvio manuale: `npx claude-flow daemon start`, `memory init`, `swarm init`
+- Per task multi-file/complessi: usa ToolSearch per trovare tool ruflo (memory_store, memory_search, hooks_route, swarm_init, agent_spawn)
+- Osserva tag `[INTELLIGENCE]` nei system-reminder per suggerimenti pattern learning
+- Provider principale: Ollama locale (GPU RTX 3070). Fallback: Claude
+- Memoria swarm: locale in `.claude-flow/data/` — NON sostituisce MCP memory globale (quella resta primaria per decisioni/progressi)

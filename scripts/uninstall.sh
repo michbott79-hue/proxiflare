@@ -20,6 +20,7 @@ info "Binaries removed"
 # Remove systemd + polkit
 rm -f /etc/systemd/system/proxiflare-daemon.service
 rm -f /usr/share/polkit-1/actions/com.proxiflare.policy
+rm -f /etc/polkit-1/rules.d/50-proxiflare.rules
 systemctl daemon-reload
 info "Service removed"
 

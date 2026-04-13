@@ -1,4 +1,5 @@
 use crate::ipc::DaemonClient;
+use crate::providers::{self, dto::ImportResult};
 use serde_json::{json, Value};
 use tauri::State;
 
@@ -240,8 +241,14 @@ pub fn system_version(client: State<DaemonClient>) -> Result<Value, String> {
 // ── DNS leak protection ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn dns_leak_enable(client: State<DaemonClient>, dns_server: String) -> Result<Value, String> {
-    client.send_request("dns_leak.enable", json!({ "dns_server": dns_server }))
+pub fn dns_leak_enable(
+    client: State<DaemonClient>,
+    dns_server: String,
+    mode: Option<String>,
+) -> Result<Value, String> {
+    let mode = mode.unwrap_or_else(|| "force-server".to_string());
+    client.send_request("dns_leak.enable",
+        json!({ "dns_server": dns_server, "mode": mode }))
 }
 
 #[tauri::command]
@@ -346,4 +353,96 @@ pub fn list_system_apps() -> Result<Value, String> {
     apps.dedup_by(|a, b| a["exec"] == b["exec"]);
 
     Ok(Value::Array(apps))
+}
+
+// ── Provider import ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn providers_list() -> Vec<(String, String)> {
+    providers::list_providers()
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+/// Import proxies from an external provider API.
+///
+/// Flow:
+///   1. Resolve the provider by id.
+///   2. Fetch its proxy list using the given credentials.
+///   3. Load current daemon proxies once for host:port dedup.
+///   4. For each new proxy, call daemon `proxy.add` and count outcomes.
+///   5. Return a structured summary (fetched / added / skipped / failed).
+#[tauri::command]
+pub async fn providers_import(
+    client: State<'_, DaemonClient>,
+    provider_id: String,
+    api_key: String,
+    api_secret: String,
+) -> Result<ImportResult, String> {
+    let provider = providers::get_provider(&provider_id)
+        .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
+
+    let imported = provider.fetch(&api_key, &api_secret).await
+        .map_err(|e| e.to_string())?;
+
+    /* Dedup key: (host, port). Safer than name — a proxy's display name can
+     * change on the provider side but its endpoint is stable. */
+    /* send_request already unwraps the daemon's double-wrapped result,
+     * so a successful proxy.list returns a bare array. */
+    let existing: std::collections::HashSet<(String, u64)> = client
+        .send_request("proxy.list", json!({}))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| {
+            let host = p.get("host")?.as_str()?.to_string();
+            let port = p.get("port")?.as_u64()?;
+            Some((host, port))
+        })
+        .collect();
+
+    let mut result = ImportResult {
+        fetched: imported.len(),
+        added: 0,
+        skipped: 0,
+        failed: 0,
+        errors: Vec::new(),
+    };
+
+    for p in imported {
+        let key = (p.host.clone(), p.port as u64);
+        if existing.contains(&key) {
+            result.skipped += 1;
+            continue;
+        }
+        let payload = json!({
+            "name":     p.name,
+            "type":     p.kind.as_str(),
+            "host":     p.host,
+            "port":     p.port,
+            "username": p.username,
+            "password": p.password,
+            "check_interval": 60,
+        });
+        match client.send_request("proxy.add", payload) {
+            Ok(resp) => {
+                if resp.get("error").is_some() {
+                    result.failed += 1;
+                    if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
+                        result.errors.push(format!("{}: {e}", p.name));
+                    }
+                } else {
+                    result.added += 1;
+                }
+            }
+            Err(e) => {
+                result.failed += 1;
+                result.errors.push(format!("{}: {e}", p.name));
+            }
+        }
+    }
+
+    Ok(result)
 }

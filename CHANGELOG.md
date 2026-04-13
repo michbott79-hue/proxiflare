@@ -9,6 +9,43 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [Unreleased] — 2026-04-13
+
+### Added
+- **GUI daemon auto-lifecycle**: opening the GUI starts `proxiflare-daemon` via systemd;
+  closing the window (or SIGTERM/SIGINT/SIGHUP) cleanly stops it. Tracks whether the
+  GUI started the daemon (via `systemctl is-active` check) so a pre-running daemon is
+  left untouched on close.
+  - New polkit rule (`scripts/50-proxiflare.rules`) authorises the `sudo` group to
+    `start/stop/restart/reload` the unit without a password prompt.
+  - New Rust dep: `signal-hook` for SIGTERM/SIGINT/SIGHUP handling in a dedicated
+    thread.
+- **DNS via proxy (DoH)** — new routing mode that completely eliminates the DNS leak
+  for apps in the proxiflare cgroup.
+  - New daemon module `daemon/src/dns_resolver.{c,h}`: UDP listener on
+    `127.0.0.1:5353` with a per-query detached thread performing DoH (HTTP/1.1 POST
+    `/dns-query`, `application/dns-message`) through the configured proxy to
+    `cloudflare-dns.com:443`.
+  - `pf_nft_dns_via_proxy(port)` in `daemon/src/nft.c`: REDIRECTs cgroup UDP/TCP :53
+    to the local resolver instead of DNAT to an external server.
+  - IPC: `dns_leak.enable` now accepts `{mode: "force-server" | "via-proxy"}`;
+    `dns_leak.status` returns the active mode. Mode is persisted in config and
+    restored across daemon restarts.
+  - GUI: new radio selector in Settings → DNS Leak Protection with two options —
+    *Force DNS server (direct)* and *Route DNS through proxy (DoH)*.
+  - Proxy selection: honours config `dns_proxy_id` if set, otherwise picks the first
+    enabled HTTP/SOCKS5 proxy. SSH proxies are skipped.
+- **Proxy provider import**: new `ImportProviderModal` in the GUI backed by a Rust
+  provider abstraction (`gui/src-tauri/src/providers/`). First provider: proxy-cheap
+  (live API, filters `status=ACTIVE`, expands each entry into HTTP + SOCKS5 rows).
+
+### Why Cloudflare (DoH) and not Quad9 or DoT
+- Quad9 DoH requires HTTP/2 (RFC 8484 §5.2) which would need `nghttp2` linking.
+- DoT on port 853 is rejected by most residential HTTP CONNECT proxies (whitelist 443).
+- Cloudflare DoH on 443 works over HTTP/1.1 and port 443 is universally allowed.
+
+---
+
 ## [0.1.0-alpha] — 2026-04-11
 
 ### Added

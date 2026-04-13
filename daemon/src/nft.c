@@ -346,12 +346,67 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * pf_nft_dns_leak_disable — Remove DNS DNAT, restore NFQUEUE
+ * pf_nft_dns_via_proxy — REDIRECT cgroup DNS to local resolver on <local_port>
+ *
+ * Unlike pf_nft_dns_leak_protect (which DNATs to an external DNS server and
+ * lets the query leak from the real IP), this redirects UDP/TCP :53 from the
+ * proxiflare cgroup to a local listener. The listener (pf_dns_resolver) then
+ * forwards each query as DNS-over-HTTPS through the configured proxy, so the
+ * real IP never emits a DNS packet.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_nft_dns_via_proxy(int local_port)
+{
+    if (local_port <= 0 || local_port > 65535) {
+        pf_log_error("nft: dns_via_proxy: invalid port %d", local_port);
+        return PF_ERR;
+    }
+
+    /* Clean any existing pf_dns_leak rules (either mode) to avoid duplicates. */
+    nft_delete_by_comment("inet", "proxiflare", "output_nat", "pf_dns_leak");
+
+    char cmd[512];
+
+    /* UDP DNS → local resolver.
+     *   - `redirect to :port` rewrites dst to 127.0.0.1:port in OUTPUT chain.
+     *   - conntrack reverses the NAT on reply so the client sees the answer
+     *     as if it came from the originally queried server.
+     *   - Excluding 127.0.0.0/8 leaves loopback resolver traffic alone. */
+    snprintf(cmd, sizeof(cmd),
+        "add rule inet proxiflare output_nat "
+        "socket cgroupv2 level 1 \"proxiflare\" "
+        "udp dport 53 ip daddr != 127.0.0.0/8 "
+        "counter redirect to :%d comment \"pf_dns_leak\"\n",
+        local_port);
+    if (nft_run(cmd) != PF_OK) {
+        pf_log_error("nft: dns_via_proxy: UDP redirect rule failed");
+        return PF_ERR;
+    }
+
+    /* TCP DNS → local resolver (same as UDP). The local resolver should
+     * accept both UDP and TCP on the same port. */
+    snprintf(cmd, sizeof(cmd),
+        "add rule inet proxiflare output_nat "
+        "socket cgroupv2 level 1 \"proxiflare\" "
+        "tcp dport 53 ip daddr != 127.0.0.0/8 "
+        "counter redirect to :%d comment \"pf_dns_leak\"\n",
+        local_port);
+    if (nft_run(cmd) != PF_OK) {
+        pf_log_error("nft: dns_via_proxy: TCP redirect rule failed");
+        return PF_ERR;
+    }
+
+    pf_log_info("nft: DNS via proxy active → local resolver :%d", local_port);
+    return PF_OK;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_nft_dns_leak_disable — Remove DNS rules (direct-mode or via-proxy mode)
  * ───────────────────────────────────────────────────────────────────────────── */
 
 int pf_nft_dns_leak_disable(void)
 {
-    /* Remove ONLY DNS DNAT rules from the nat chain.
+    /* Remove ONLY DNS rules from the nat chain (matched by comment).
      * The output chain (route type) with cgroup marks is untouched. */
     nft_delete_by_comment("inet", "proxiflare", "output_nat", "pf_dns_leak");
     pf_log_info("nft: DNS leak protection disabled (cgroup marks preserved)");

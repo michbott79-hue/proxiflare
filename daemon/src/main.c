@@ -25,6 +25,7 @@
 #include "crypto.h"
 #include "ipc.h"
 #include "dns.h"
+#include "dns_resolver.h"
 #include "sni.h"
 #include "rules.h"
 #include "proxy_socks.h"
@@ -61,6 +62,7 @@ struct pf_ctx {
     pf_crypto_t    crypto;
     pf_ipc_t       ipc;
     pf_dns_t       dns;
+    pf_dns_resolver_t dns_resolver;
     pf_tproxy_t    tproxy;
     pf_logger_t    logger;
     pf_ruleset_t  *ruleset;   /* heap-allocated: ~4.5MB (PF_MAX_RULES * sizeof(pf_rule_t)) */
@@ -1301,21 +1303,56 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         /* Set running=false to exit main loop after sending response */
         ctx->running = 0;
 
-    /* ── dns_leak.enable ────────────────────────────────────────────────── */
+    /* ── dns_leak.enable ────────────────────────────────────────────────── *
+     *  Two modes:
+     *    mode=force-server (default, legacy) — DNAT cgroup DNS → dns_server
+     *    mode=via-proxy                     — REDIRECT → local DoH resolver
+     *  Switching modes tears down the other cleanly.
+     * ────────────────────────────────────────────────────────────────────── */
     } else if (strcmp(method, "dns_leak.enable") == 0) {
-        /* Accept either "dns_server" (internal) or "server" (what the GUI
-         * and ad-hoc IPC tests typically send). Falling back to 1.1.1.1
-         * when missing meant the user's chosen server was silently ignored. */
+        cJSON *mode_v   = params ? cJSON_GetObjectItem(params, "mode") : NULL;
         cJSON *server_v = NULL;
         if (params) {
             server_v = cJSON_GetObjectItem(params, "dns_server");
             if (!server_v) server_v = cJSON_GetObjectItem(params, "server");
         }
-        const char *dns = (server_v && server_v->valuestring && server_v->valuestring[0])
-                          ? server_v->valuestring : "1.1.1.1";
-        if (pf_nft_dns_leak_protect(dns) == PF_OK) {
+        const char *mode = (mode_v && mode_v->valuestring && mode_v->valuestring[0])
+                           ? mode_v->valuestring : "force-server";
+        const char *dns  = (server_v && server_v->valuestring && server_v->valuestring[0])
+                           ? server_v->valuestring : "1.1.1.1";
+
+        int ok = 0;
+        if (strcmp(mode, "via-proxy") == 0) {
+            /* Spin up local resolver if not already running. */
+            if (ctx->dns_resolver.udp_fd <= 0) {
+                if (pf_dns_resolver_init(&ctx->dns_resolver, &ctx->config,
+                                         PF_DNS_RESOLVER_PORT) == PF_OK) {
+                    struct epoll_event ev;
+                    ev.events  = EPOLLIN;
+                    ev.data.fd = ctx->dns_resolver.udp_fd;
+                    epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD,
+                              ctx->dns_resolver.udp_fd, &ev);
+                }
+            }
+            if (ctx->dns_resolver.udp_fd > 0 &&
+                pf_nft_dns_via_proxy(PF_DNS_RESOLVER_PORT) == PF_OK) {
+                ok = 1;
+            }
+        } else {
+            /* force-server: ensure the local resolver is torn down first. */
+            if (ctx->dns_resolver.udp_fd > 0) {
+                epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL,
+                          ctx->dns_resolver.udp_fd, NULL);
+                pf_dns_resolver_close(&ctx->dns_resolver);
+            }
+            if (pf_nft_dns_leak_protect(dns) == PF_OK) ok = 1;
+        }
+
+        if (ok) {
             pf_config_set(&ctx->config, "dns_leak_enabled", "true");
-            pf_config_set(&ctx->config, "dns_server", dns);
+            pf_config_set(&ctx->config, "dns_mode",         mode);
+            if (strcmp(mode, "force-server") == 0)
+                pf_config_set(&ctx->config, "dns_server", dns);
             cJSON_AddStringToObject(resp, "result", "ok");
         } else {
             cJSON_AddStringToObject(resp, "error", "failed to set DNS rules");
@@ -1324,17 +1361,25 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
     /* ── dns_leak.disable ───────────────────────────────────────────────── */
     } else if (strcmp(method, "dns_leak.disable") == 0) {
         pf_nft_dns_leak_disable();
+        if (ctx->dns_resolver.udp_fd > 0) {
+            epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL,
+                      ctx->dns_resolver.udp_fd, NULL);
+            pf_dns_resolver_close(&ctx->dns_resolver);
+        }
         pf_config_set(&ctx->config, "dns_leak_enabled", "false");
         cJSON_AddStringToObject(resp, "result", "ok");
 
     /* ── dns_leak.status ────────────────────────────────────────────────── */
     } else if (strcmp(method, "dns_leak.status") == 0) {
         char enabled[8]  = "false";
+        char mode[32]    = "force-server";
         char server[64]  = "1.1.1.1";
         pf_config_get(&ctx->config, "dns_leak_enabled", enabled, (int)sizeof(enabled));
+        pf_config_get(&ctx->config, "dns_mode",         mode,    (int)sizeof(mode));
         pf_config_get(&ctx->config, "dns_server",       server,  (int)sizeof(server));
         cJSON *r = cJSON_CreateObject();
         cJSON_AddBoolToObject  (r, "enabled",    strcmp(enabled, "true") == 0);
+        cJSON_AddStringToObject(r, "mode",       mode);
         cJSON_AddStringToObject(r, "dns_server", server);
         cJSON_AddItemToObject  (resp, "result", r);
 
@@ -1884,17 +1929,33 @@ int main(int argc, char *argv[])
             pf_log_warn("nft_setup_tproxy failed");
         pf_log_info("nftables rules installed");
 
-        /* Restore DNS leak protection if it was active before daemon restart */
+        /* Restore DNS leak protection if it was active before daemon restart.
+         * Two modes:
+         *   - "force-server" (default, legacy): DNAT cgroup DNS → dns_server
+         *   - "via-proxy": REDIRECT cgroup DNS → local DoH resolver → proxy */
         {
             char dns_leak[8]    = "false";
+            char dns_mode[32]   = "force-server";
             char dns_server[64] = "1.1.1.1";
             pf_config_get(&ctx->config, "dns_leak_enabled", dns_leak, (int)sizeof(dns_leak));
+            pf_config_get(&ctx->config, "dns_mode", dns_mode, (int)sizeof(dns_mode));
             if (strcmp(dns_leak, "true") == 0) {
-                pf_config_get(&ctx->config, "dns_server", dns_server, (int)sizeof(dns_server));
-                if (pf_nft_dns_leak_protect(dns_server) == PF_OK)
-                    pf_log_info("DNS leak protection restored (server: %s)", dns_server);
-                else
-                    pf_log_warn("DNS leak protection restore failed");
+                if (strcmp(dns_mode, "via-proxy") == 0) {
+                    if (pf_dns_resolver_init(&ctx->dns_resolver, &ctx->config,
+                                             PF_DNS_RESOLVER_PORT) == PF_OK &&
+                        pf_nft_dns_via_proxy(PF_DNS_RESOLVER_PORT) == PF_OK) {
+                        pf_log_info("DNS via proxy restored (local :%d)",
+                                    PF_DNS_RESOLVER_PORT);
+                    } else {
+                        pf_log_warn("DNS via proxy restore failed");
+                    }
+                } else {
+                    pf_config_get(&ctx->config, "dns_server", dns_server, (int)sizeof(dns_server));
+                    if (pf_nft_dns_leak_protect(dns_server) == PF_OK)
+                        pf_log_info("DNS leak protection restored (server: %s)", dns_server);
+                    else
+                        pf_log_warn("DNS leak protection restore failed");
+                }
             }
         }
     }
@@ -1945,6 +2006,10 @@ int main(int argc, char *argv[])
     if (ctx->dns.fd > 0)
         epoll_add(ctx->epoll_fd, ctx->dns.fd, EPOLLIN);
 
+    /* DoH resolver fd (only present if via-proxy mode active) */
+    if (ctx->dns_resolver.udp_fd > 0)
+        epoll_add(ctx->epoll_fd, ctx->dns_resolver.udp_fd, EPOLLIN);
+
     /* TPROXY listen fd */
     if (ctx->tproxy.listen_fd > 0)
         epoll_add(ctx->epoll_fd, ctx->tproxy.listen_fd, EPOLLIN);
@@ -1992,6 +2057,13 @@ int main(int argc, char *argv[])
                 /* ── DNS NFQUEUE ───────────────────────────────────────── */
                 if (ctx->dns.fd > 0 && fd == ctx->dns.fd) {
                     pf_dns_process(&ctx->dns);
+                    continue;
+                }
+
+                /* ── DoH resolver (via-proxy DNS mode) ─────────────────── */
+                if (ctx->dns_resolver.udp_fd > 0 &&
+                    fd == ctx->dns_resolver.udp_fd) {
+                    pf_dns_resolver_process(&ctx->dns_resolver);
                     continue;
                 }
 

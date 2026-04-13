@@ -41,6 +41,7 @@ set(DAEMON_SOURCES
     src/crypto.c
     src/ipc.c
     src/dns.c
+    src/dns_resolver.c
     src/sni.c
     src/rules.c
     src/proxy_socks.c

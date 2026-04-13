@@ -41,6 +41,7 @@ export default function Settings({ daemon }: Props) {
 
   /* DNS leak protection state */
   const [dnsEnabled, setDnsEnabled]       = useState(false);
+  const [dnsMode, setDnsMode]             = useState<'force-server' | 'via-proxy'>('force-server');
   const [dnsServer, setDnsServer]         = useState('1.1.1.1');
   const [dnsCustom, setDnsCustom]         = useState('');
   const [dnsDropOpen, setDnsDropOpen]     = useState(false);
@@ -56,6 +57,7 @@ export default function Settings({ daemon }: Props) {
     api.dnsLeakStatus()
       .then(s => {
         setDnsEnabled(s.enabled);
+        setDnsMode(s.mode);
         const preset = DNS_PRESETS.find(p => p.value === s.dns_server);
         if (preset) {
           setDnsServer(s.dns_server);
@@ -91,7 +93,7 @@ export default function Settings({ daemon }: Props) {
         await api.dnsLeakDisable();
         setDnsEnabled(false);
       } else {
-        await api.dnsLeakEnable(effectiveDns);
+        await api.dnsLeakEnable(effectiveDns, dnsMode);
         setDnsEnabled(true);
       }
     } catch (e) {
@@ -108,9 +110,20 @@ export default function Settings({ daemon }: Props) {
     /* If already enabled, update the active server immediately */
     if (dnsEnabled) {
       try {
-        await api.dnsLeakEnable(value);
+        await api.dnsLeakEnable(value, dnsMode);
       } catch (e) {
         console.error('DNS server update error:', e);
+      }
+    }
+  }
+
+  async function handleDnsModeChange(value: 'force-server' | 'via-proxy') {
+    setDnsMode(value);
+    if (dnsEnabled) {
+      try {
+        await api.dnsLeakEnable(effectiveDns, value);
+      } catch (e) {
+        console.error('DNS mode change error:', e);
       }
     }
   }
@@ -289,7 +302,7 @@ export default function Settings({ daemon }: Props) {
           )}
         </div>
         <p className="mb-4 text-xs text-[#64748b]">
-          Prevents DNS queries from leaking to your ISP. All DNS is redirected to a secure server.
+          Prevents DNS queries from leaking to your ISP. Choose how the DNS is routed.
         </p>
         <div className="space-y-4">
           {/* Toggle */}
@@ -308,6 +321,39 @@ export default function Settings({ daemon }: Props) {
                 }`}
               />
             </button>
+          </div>
+
+          {/* Mode selector */}
+          <div className="space-y-2">
+            <span className="text-sm">Routing mode</span>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <button
+                onClick={() => handleDnsModeChange('force-server')}
+                className={`rounded-md border px-3 py-2 text-left text-xs transition-colors ${
+                  dnsMode === 'force-server'
+                    ? 'border-[#6366f1] bg-[#6366f1]/10 text-[#e2e8f0]'
+                    : 'border-[#2d3348] bg-[#232733] text-[#94a3b8] hover:border-[#475569]'
+                }`}
+              >
+                <div className="font-medium text-[#e2e8f0]">Force DNS server (direct)</div>
+                <div className="mt-0.5 text-[11px] text-[#64748b]">
+                  Apps redirected to chosen server. Query still exits from your real IP.
+                </div>
+              </button>
+              <button
+                onClick={() => handleDnsModeChange('via-proxy')}
+                className={`rounded-md border px-3 py-2 text-left text-xs transition-colors ${
+                  dnsMode === 'via-proxy'
+                    ? 'border-[#6366f1] bg-[#6366f1]/10 text-[#e2e8f0]'
+                    : 'border-[#2d3348] bg-[#232733] text-[#94a3b8] hover:border-[#475569]'
+                }`}
+              >
+                <div className="font-medium text-[#e2e8f0]">Route DNS through proxy (DoH)</div>
+                <div className="mt-0.5 text-[11px] text-[#64748b]">
+                  DNS-over-HTTPS tunneled through the configured proxy. Zero DNS leak.
+                </div>
+              </button>
+            </div>
           </div>
 
           {/* DNS Server selector */}

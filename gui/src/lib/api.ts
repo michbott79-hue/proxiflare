@@ -149,17 +149,24 @@ export async function systemVersion(): Promise<string> {
 
 // ── DNS leak protection ─────────────────────────────────────────
 
-export async function dnsLeakEnable(dnsServer: string): Promise<void> {
-  return invoke<void>('dns_leak_enable', { dnsServer });
+export type DnsMode = 'force-server' | 'via-proxy';
+
+export async function dnsLeakEnable(dnsServer: string, mode: DnsMode = 'force-server'): Promise<void> {
+  return invoke<void>('dns_leak_enable', { dnsServer, mode });
 }
 
 export async function dnsLeakDisable(): Promise<void> {
   return invoke<void>('dns_leak_disable');
 }
 
-export async function dnsLeakStatus(): Promise<{ enabled: boolean; dns_server: string }> {
+export async function dnsLeakStatus(): Promise<{ enabled: boolean; mode: DnsMode; dns_server: string }> {
   const raw = await invoke<any>('dns_leak_status');
-  return raw?.result ?? raw ?? { enabled: false, dns_server: '1.1.1.1' };
+  const r = raw?.result ?? raw ?? {};
+  return {
+    enabled:    !!r.enabled,
+    mode:       (r.mode === 'via-proxy' ? 'via-proxy' : 'force-server') as DnsMode,
+    dns_server: r.dns_server ?? '1.1.1.1',
+  };
 }
 
 // ── Log polling ─────────────────────────────────────────────────────────────
@@ -208,6 +215,34 @@ export async function inspectStatus(): Promise<any> {
 
 export async function inspectGenerateCa(): Promise<void> {
   return invoke<void>('inspect_generate_ca');
+}
+
+// ── Provider import (proxy-cheap, …) ────────────────────────────
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+}
+
+export interface ImportResult {
+  fetched: number;
+  added: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+}
+
+export async function providersList(): Promise<ProviderInfo[]> {
+  const raw = await invoke<Array<[string, string]>>('providers_list');
+  return raw.map(([id, name]) => ({ id, name }));
+}
+
+export async function providersImport(
+  providerId: string,
+  apiKey: string,
+  apiSecret: string,
+): Promise<ImportResult> {
+  return invoke<ImportResult>('providers_import', { providerId, apiKey, apiSecret });
 }
 
 // ── System apps ─────────────────────────────────────────────────

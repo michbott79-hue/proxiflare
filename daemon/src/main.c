@@ -749,12 +749,71 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         if (!params) {
             cJSON_AddStringToObject(resp, "error", "missing params");
         } else {
+            /* Partial-update (same pattern as rule.edit): load the existing
+             * row so a toggle like {"id":X,"enabled":false} doesn't wipe
+             * host/port/credentials. Then detect enabled transitions to
+             * add/remove cgroup+nft marks on all rules referencing this
+             * proxy — so toggling a proxy off really makes its rules go
+             * direct (no TPROXY interception) rather than staying in the
+             * cgroup and getting downgraded to direct at connect time. */
             pf_proxy_t p;
-            proxy_from_json(&p, params);
-            if (pf_config_proxy_update(&ctx->config, &p) == PF_OK)
-                cJSON_AddStringToObject(resp, "result", "ok");
-            else
-                cJSON_AddStringToObject(resp, "error", "db error");
+            cJSON *id_v = cJSON_GetObjectItem(params, "id");
+            int pid = id_v ? (int)id_v->valuedouble : 0;
+            int proxy_loaded = (pid > 0 && pf_config_proxy_get(&ctx->config, pid, &p) == PF_OK);
+            if (!proxy_loaded) {
+                cJSON_AddStringToObject(resp, "error", "proxy not found");
+            } else {
+                int was_enabled = p.enabled;
+                cJSON *v;
+                if ((v = cJSON_GetObjectItem(params, "name")) && v->valuestring)
+                    snprintf(p.name, sizeof(p.name), "%s", v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "type")) && v->valuestring)
+                    p.type = pf_proxy_type_from_str(v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "host")) && v->valuestring)
+                    snprintf(p.host, sizeof(p.host), "%s", v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "port")))
+                    p.port = (uint16_t)v->valuedouble;
+                if ((v = cJSON_GetObjectItem(params, "username")) && v->valuestring)
+                    snprintf(p.username, sizeof(p.username), "%s", v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "password")) && v->valuestring)
+                    snprintf(p.password, sizeof(p.password), "%s", v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "ssh_key_path")) && v->valuestring)
+                    snprintf(p.ssh_key_path, sizeof(p.ssh_key_path), "%s", v->valuestring);
+                if ((v = cJSON_GetObjectItem(params, "enabled")))
+                    p.enabled = cJSON_IsTrue(v) ? 1 : 0;
+
+                if (pf_config_proxy_update(&ctx->config, &p) == PF_OK) {
+                    /* Sync cgroup/nft state for rules referencing this proxy,
+                     * but only when enabled actually transitioned. */
+                    if (was_enabled != p.enabled) {
+                        pf_rule_t rbuf[PF_MAX_RULES];
+                        int rcount = 0;
+                        pf_config_rule_list(&ctx->config, rbuf, PF_MAX_RULES, &rcount);
+                        int synced = 0;
+                        for (int i = 0; i < rcount; i++) {
+                            const pf_rule_t *r = &rbuf[i];
+                            if (r->action != PF_ACTION_PROXY) continue;
+                            if (r->proxy_id != p.id) continue;
+                            if (!r->enabled) continue; /* user already turned it off */
+                            if (!r->app_path[0]) continue;
+                            if (p.enabled) {
+                                pf_cgroup_create_rule((int)r->id);
+                                pf_nft_add_cgroup_mark((int)r->id);
+                                pf_cgroup_assign_running_pids((int)r->id, r->app_path);
+                            } else {
+                                pf_nft_remove_cgroup_mark((int)r->id);
+                                pf_cgroup_remove_rule((int)r->id);
+                            }
+                            synced++;
+                        }
+                        pf_log_info("proxy.edit: proxy '%s' %s → synced %d rule(s)",
+                                    p.name, p.enabled ? "enabled" : "disabled", synced);
+                    }
+                    cJSON_AddStringToObject(resp, "result", "ok");
+                } else {
+                    cJSON_AddStringToObject(resp, "error", "db error");
+                }
+            }
         }
 
     /* ── proxy.delete ────────────────────────────────────────────────────── */

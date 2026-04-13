@@ -120,7 +120,12 @@ int pf_nft_init(void)
         "        type route hook output priority 0; policy accept;\n"
         "    }\n"
         "    chain output_nat {\n"
-        "        type nat hook output priority 0; policy accept;\n"
+        /* priority -100 = dstnat, the canonical spot for DNAT in the output
+         * hook. At priority 0 (filter) DNAT runs after the routing decision
+         * has already been made on the original destination, so the packet
+         * goes out on the wrong path (classic symptom: DNAT rule counters
+         * increment but traffic still times out). */
+        "        type nat hook output priority -100; policy accept;\n"
         "    }\n"
         "}\n";
 
@@ -229,10 +234,16 @@ int pf_nft_add_cgroup_mark(int rule_id)
      * for matching processes in a specific cgroup hierarchy node.
      * "level 2" means 2 levels deep in the hierarchy: proxiflare/rule_N
      * Comment tag enables targeted removal without flushing the chain. */
+    /* Mark only TCP. If we mark UDP/ICMP too, fwmark+table 100 sends them
+     * to loopback where nothing listens → black hole. DNS (UDP 53) in
+     * particular breaks: the packet gets marked, routed to lo, dropped.
+     * DNS needs to flow normally (or through NFQUEUE/DNAT in leak mode),
+     * not through TPROXY. */
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
         "add rule inet proxiflare output socket cgroupv2 level 2 "
-        "\"proxiflare/rule_%d\" meta mark set 1 comment \"pf_cgroup_%d\"\n",
+        "\"proxiflare/rule_%d\" meta l4proto tcp meta mark set 1 "
+        "comment \"pf_cgroup_%d\"\n",
         rule_id, rule_id);
 
     if (nft_run(cmd) != PF_OK) {
@@ -286,9 +297,31 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 
     char cmd[512];
 
-    /* UDP DNS — must be in nat chain for DNAT to work */
+    /* Scope DNAT to proxiflare cgroup only. Rewriting all outbound UDP/TCP
+     * 53 system-wide breaks the local resolver (systemd-resolved on
+     * 127.0.0.53) because the loopback→DNAT→remote return path isn't SNAT'd
+     * and conntrack mismatches. Scoping to the cgroup leaves the rest of the
+     * system on its normal resolver while still forcing intercepted apps
+     * through the chosen DNS server. */
+
+    /* DNAT matrix:
+     *   - scope:  only packets from proxiflare cgroup (no system impact)
+     *   - src:    skip 127.0.0.0/8 destinations — DNAT'ing loopback traffic
+     *             (e.g. dig → 127.0.0.53 → systemd-resolved) to an external
+     *             IP breaks conntrack reverse-NAT: the reply comes back on
+     *             eth0 with src=1.1.1.1 but the original socket was bound
+     *             to lo, lookup fails, dig times out. Leaving loopback DNS
+     *             alone keeps systemd-resolved working as usual for the app.
+     *   - dst:    also skip the target DNS server itself (anti-loop).
+     * Net effect: apps that try to contact an external DNS server directly
+     * (e.g. Firefox DoH pointing to 8.8.8.8) are redirected to the chosen
+     * leak-protection server. Apps using the local resolver pass through. */
+
+    /* UDP DNS */
     snprintf(cmd, sizeof(cmd),
-        "add rule inet proxiflare output_nat udp dport 53 ip daddr != %s "
+        "add rule inet proxiflare output_nat "
+        "socket cgroupv2 level 1 \"proxiflare\" "
+        "udp dport 53 ip daddr != { 127.0.0.0/8, %s } "
         "counter dnat to %s comment \"pf_dns_leak\"\n",
         dns_server, dns_server);
     if (nft_run(cmd) != PF_OK) {
@@ -298,7 +331,9 @@ int pf_nft_dns_leak_protect(const char *dns_server)
 
     /* TCP DNS */
     snprintf(cmd, sizeof(cmd),
-        "add rule inet proxiflare output_nat tcp dport 53 ip daddr != %s "
+        "add rule inet proxiflare output_nat "
+        "socket cgroupv2 level 1 \"proxiflare\" "
+        "tcp dport 53 ip daddr != { 127.0.0.0/8, %s } "
         "counter dnat to %s comment \"pf_dns_leak\"\n",
         dns_server, dns_server);
     if (nft_run(cmd) != PF_OK) {

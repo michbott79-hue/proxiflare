@@ -189,15 +189,21 @@ export interface LogEntryRaw {
 }
 
 export async function logRecent(sinceSeq: number): Promise<LogEntryRaw[]> {
-  const result = await invoke<any>('log_recent', { sinceSeq });
-  return Array.isArray(result) ? result : [];
+  /* Same double-wrap unwrap as inspectList — daemon returns {"result":[...]} */
+  const raw = await invoke<any>('log_recent', { sinceSeq });
+  const arr = raw?.result ?? raw;
+  return Array.isArray(arr) ? arr : [];
 }
 
 // ── Inspect (MITM HTTP interception) ───────────────────────────────────────
 
 export async function inspectList(sinceSeq: number): Promise<any[]> {
-  const result = await invoke<any>('inspect_list', { sinceSeq });
-  return Array.isArray(result) ? result : [];
+  /* Daemon returns {"result": {"result": [...]}}. Tauri's send_request
+   * unwraps the outer layer; we still need to unwrap the inner `result`
+   * field. Mirror the same defensive chain used in inspectStatus. */
+  const raw = await invoke<any>('inspect_list', { sinceSeq });
+  const arr = raw?.result ?? raw;
+  return Array.isArray(arr) ? arr : [];
 }
 
 export async function inspectEnable(): Promise<void> {

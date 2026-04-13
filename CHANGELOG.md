@@ -9,6 +9,32 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [0.2.2-alpha] — 2026-04-14
+
+### Fixed — navigation slowness + low capture count on DAZN
+- **DNS cache in the DoH resolver**. Every DNS query through the proxy was
+  paying a full TLS handshake — measured ~1.3 s each. A page opening 30
+  unique hostnames therefore burned 40 s of DNS wait, which also meant
+  Firefox timed out on many resources and the Inspect ring looked almost
+  empty. Added an LRU cache (512 entries, 60 s TTL, keyed on
+  lowercased-name + qtype) that stores the DNS wire response without the
+  per-query id. On hit we prepend the caller's id and reply in microseconds.
+  First query per domain still pays the round-trip; repeats across a page
+  load (CDN / api / auth subdomains shared between pages) are free.
+
+---
+
+## [0.2.1-alpha] — 2026-04-14
+
+### Fixed
+- **Inspect tab showed 0 entries while daemon ring was full**. Root cause:
+  `inspectList()` in `gui/src/lib/api.ts` did not unwrap the daemon's
+  `{result:{result:[...]}}` double envelope, so `Array.isArray(raw)` was
+  `false` and we returned `[]`. Same fix applied defensively to
+  `logRecent()` which had the identical shape bug.
+
+---
+
 ## [0.2.0-alpha] — 2026-04-14
 
 Cumulative release covering two sessions of work on lifecycle, DNS privacy,

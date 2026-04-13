@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "proxiflare"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",

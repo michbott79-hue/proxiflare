@@ -9,6 +9,42 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [Unreleased] — 2026-04-14
+
+### Added — HTTP capture: decompression + noise filters + bigger ring
+- **Body decompression on capture** (`daemon/src/body_decode.{c,h}`): the captured
+  body is decompressed before being stored in the inspect ring. Supported
+  encodings: gzip/deflate (zlib), brotli (libbrotlidec), zstd (libzstd). Matches
+  the standard behaviour of mitmproxy/Charles/Burp — decode on capture, not on
+  view. Result: bodies are readable JSON/HTML/XML instead of opaque compressed
+  bytes.
+- **Tracker-domain pre-buffer filter**: a curated blocklist of ~40 ad/tracker
+  backends (doubleclick, adsrvr.org, criteo, rubiconproject, adnxs,
+  amazon-adsystem, teads, pubmatic, scorecardresearch, nr-data.net, etc.) is
+  matched against the connection domain before HTTP parsing. Matching entries
+  are dropped silently so they never fill the ring.
+- **Content-Type pre-buffer filter**: response Content-Type is inspected after
+  parse and `image/*`, `font/*`, `audio/*`, `video/*`, `application/font*`, and
+  `application/octet-stream` are dropped — they never carry debuggable payload.
+- **Inspect ring grown** from 200 → 5000 entries. At ~8 KB of decoded body per
+  entry and ~500 B JSON overhead this is ~42 MB RAM, acceptable.
+
+### Added — Inspect GUI
+- Content-Type dropdown (all / JSON / HTML / XML / text / other) and HTTP status
+  class dropdown (all / 2xx / 3xx / 4xx / 5xx) in the Inspect toolbar — applied
+  against the paired response via a domain+port+ts-bucket index so the request
+  row is the filter unit.
+- Body panel now surfaces the original `Content-Encoding` and whether decoding
+  succeeded, so a stray unhandled codec is visible rather than silent garbage.
+- GUI in-memory cap aligned with the daemon ring (500 → 5000).
+
+### Why not HTTP/2 native
+Our MITM forces ALPN=http/1.1 which covers ~85% of real-world traffic. Native
+h2 parsing needs nghttp2 + stream multiplexing + HPACK — ~3-5 days of work for
+the remaining 15% (mostly gRPC and a few sites). Deferred until requested.
+
+---
+
 ## [Unreleased] — 2026-04-13
 
 ### Added

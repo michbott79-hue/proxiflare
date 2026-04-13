@@ -40,6 +40,7 @@
 #include "stats.h"
 #include "mitm.h"
 #include "http_parser.h"
+#include "body_decode.h"
 #include <cJSON.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -94,12 +95,69 @@ static int rules_reload_locked(struct pf_ctx *ctx)
  * HTTP inspect ring buffer — stores intercepted request/response summaries
  * ────────────────────────────────────────────────────────────────────────── */
 
-#define PF_INSPECT_RING_SIZE 200
+#define PF_INSPECT_RING_SIZE     5000
+#define PF_INSPECT_BODY_CAP      8192   /* decoded body bytes kept per entry */
 
 static cJSON   *g_inspect_ring[PF_INSPECT_RING_SIZE];
 static int      g_inspect_ring_head  = 0;
 static int      g_inspect_ring_count = 0;
 static uint64_t g_inspect_seq        = 0;
+
+/* Pre-buffer noise filters. Keep the ring dominated by user-meaningful
+ * traffic (API, HTML, app XHR) rather than ad/tracker/asset bursts.
+ *
+ * Domain blocklist: the 30-ish most common ad/tracker/analytics backends.
+ * Suffix-matched against the connection domain — any subdomain of a listed
+ * base is dropped pre-parse. Not EasyList (too broad); this is the pragmatic
+ * shortlist shared by mitmproxy/Charles/Burp out-of-the-box.
+ *
+ * Content-Type suffix list: binary asset types that never carry debuggable
+ * payload. Dropped after parse based on the response's Content-Type. */
+static const char *const g_tracker_domains[] = {
+    "doubleclick.net",   "googlesyndication.com",  "googleadservices.com",
+    "googletagmanager.com","googletagservices.com","google-analytics.com",
+    "amazon-adsystem.com","adsrvr.org",            "teads.tv",
+    "scorecardresearch.com","quantserve.com",       "omtrdc.net",
+    "demdex.net",         "2mdn.net",              "adnxs.com",
+    "criteo.com",         "criteo.net",            "pubmatic.com",
+    "rubiconproject.com", "openx.net",             "taboola.com",
+    "outbrain.com",       "chartbeat.net",         "hotjar.com",
+    "clarity.ms",         "fullstory.com",         "segment.io",
+    "mixpanel.com",       "amplitude.com",         "facebook.net",
+    "fbcdn.net",          "connect.facebook.net",  "pagead2.googlesyndication.com",
+    "bam.nr-data.net",    "newrelic.com",          "nr-data.net",
+    "bam-cell.nr-data.net","static.ads-twitter.com","snap.licdn.com",
+    NULL
+};
+
+static int domain_is_tracker(const char *domain)
+{
+    if (!domain || !domain[0]) return 0;
+    size_t dl = strlen(domain);
+    for (int i = 0; g_tracker_domains[i]; i++) {
+        const char *t = g_tracker_domains[i];
+        size_t tl = strlen(t);
+        if (tl > dl) continue;
+        /* Suffix match, anchored on a dot boundary for subdomains */
+        const char *tail = domain + (dl - tl);
+        if (strcasecmp(tail, t) != 0) continue;
+        if (tail == domain || *(tail - 1) == '.') return 1;
+    }
+    return 0;
+}
+
+static int content_type_is_asset(const char *ct)
+{
+    if (!ct || !ct[0]) return 0;
+    /* Match the leading major type — ignore any trailing "; charset=..." */
+    if (strncasecmp(ct, "image/", 6)  == 0) return 1;
+    if (strncasecmp(ct, "font/", 5)   == 0) return 1;
+    if (strncasecmp(ct, "audio/", 6)  == 0) return 1;
+    if (strncasecmp(ct, "video/", 6)  == 0) return 1;
+    if (strncasecmp(ct, "application/font", 16) == 0) return 1;
+    if (strncasecmp(ct, "application/octet-stream", 24) == 0) return 1;
+    return 0;
+}
 
 /* Callback from tproxy relay — parse HTTP and store in ring */
 static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
@@ -107,6 +165,10 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
 {
     (void)userdata;
     if (!data || len < 4) return;
+
+    /* Pre-parse drop: tracker/ad domain noise. Most hits here are request-side
+     * already but response-side also benefits from the early return. */
+    if (conn->domain[0] && domain_is_tracker(conn->domain)) return;
 
     pf_http_msg_t msg;
     int rc;
@@ -117,6 +179,13 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
         rc = pf_http_parse_response((const char *)data, len, &msg);
 
     if (rc != 0) return; /* not a complete HTTP message (yet) */
+
+    /* Post-parse drop: static asset content types on responses. Image/font
+     * traffic has no debugging value and floods the ring on page loads. */
+    if (!is_request) {
+        const char *ct = pf_http_get_header(&msg, "Content-Type");
+        if (content_type_is_asset(ct)) return;
+    }
 
     cJSON *entry = cJSON_CreateObject();
     cJSON_AddNumberToObject(entry, "seq", (double)(++g_inspect_seq));
@@ -135,6 +204,8 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
         cJSON_AddNumberToObject(entry, "status", msg.status_code);
         cJSON_AddStringToObject(entry, "status_text", msg.status_text);
         cJSON_AddStringToObject(entry, "version", msg.version);
+        const char *ct = pf_http_get_header(&msg, "Content-Type");
+        if (ct) cJSON_AddStringToObject(entry, "content_type", ct);
     }
 
     /* Headers as object */
@@ -143,16 +214,30 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
         cJSON_AddStringToObject(hdrs, msg.headers[i].key, msg.headers[i].value);
     cJSON_AddItemToObject(entry, "headers", hdrs);
 
-    /* Body (truncated to 4KB for JSON transport) */
+    /* Body — decompress (gzip/br/zstd) so the GUI shows readable text. */
     if (msg.body && msg.body_len > 0) {
-        size_t cap = msg.body_len < 4096 ? msg.body_len : 4096;
-        char *body_str = (char *)malloc(cap + 1);
-        if (body_str) {
-            memcpy(body_str, msg.body, cap);
-            body_str[cap] = '\0';
-            cJSON_AddStringToObject(entry, "body", body_str);
-            cJSON_AddNumberToObject(entry, "body_len", (double)msg.body_len);
-            free(body_str);
+        const char *enc = pf_http_get_header(&msg, "Content-Encoding");
+        char decoded[PF_INSPECT_BODY_CAP + 1];
+        size_t cap = PF_INSPECT_BODY_CAP;
+        int ok = pf_body_decode(enc, msg.body, msg.body_len, decoded, &cap);
+        if (ok == 0) {
+            decoded[cap] = '\0';
+            cJSON_AddStringToObject(entry, "body", decoded);
+            cJSON_AddNumberToObject(entry, "body_len", (double)cap);
+            if (enc && enc[0] && strcasecmp(enc, "identity") != 0)
+                cJSON_AddStringToObject(entry, "body_encoding_orig", enc);
+            cJSON_AddBoolToObject(entry, "body_decoded", 1);
+        } else {
+            /* Decode failure — preserve raw bytes up to cap so the user sees
+             * *something* and the failing encoding is visible. */
+            size_t n = msg.body_len < PF_INSPECT_BODY_CAP
+                       ? msg.body_len : PF_INSPECT_BODY_CAP;
+            memcpy(decoded, msg.body, n);
+            decoded[n] = '\0';
+            cJSON_AddStringToObject(entry, "body", decoded);
+            cJSON_AddNumberToObject(entry, "body_len", (double)n);
+            cJSON_AddBoolToObject(entry, "body_decoded", 0);
+            if (enc) cJSON_AddStringToObject(entry, "body_encoding_orig", enc);
         }
     }
 

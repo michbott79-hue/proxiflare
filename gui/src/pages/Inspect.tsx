@@ -14,10 +14,35 @@ interface InspectEntry {
   version?: string;
   status?: number;
   status_text?: string;
+  content_type?: string;
   headers: Record<string, string>;
   body?: string;
   body_len?: number;
+  body_decoded?: boolean;
+  body_encoding_orig?: string;
   content_length?: number;
+}
+
+type CtypeFilter  = 'all' | 'json' | 'html' | 'xml' | 'text' | 'other';
+type StatusFilter = 'all' | '2xx' | '3xx' | '4xx' | '5xx';
+
+function ctypeMatches(entry_ct: string | undefined, filter: CtypeFilter): boolean {
+  if (filter === 'all') return true;
+  const ct = (entry_ct || '').toLowerCase();
+  switch (filter) {
+    case 'json':  return ct.includes('json');
+    case 'html':  return ct.includes('html');
+    case 'xml':   return ct.includes('xml');
+    case 'text':  return ct.startsWith('text/') && !ct.includes('html');
+    case 'other': return !ct.includes('json') && !ct.includes('html') &&
+                         !ct.includes('xml')  && !ct.startsWith('text/');
+  }
+}
+
+function statusMatches(status: number | undefined, filter: StatusFilter): boolean {
+  if (filter === 'all' || !status) return filter === 'all';
+  const s = Math.floor(status / 100);
+  return filter === `${s}xx`;
 }
 
 interface InspectStatus {
@@ -50,6 +75,8 @@ export default function Inspect() {
   const [status, setStatus] = useState<InspectStatus | null>(null);
   const [selected, setSelected] = useState<InspectEntry | null>(null);
   const [filter, setFilter] = useState('');
+  const [ctypeFilter,  setCtypeFilter]  = useState<CtypeFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [toggling, setToggling] = useState(false);
   const seqRef = useRef(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -67,7 +94,9 @@ export default function Inspect() {
       if (Array.isArray(raw) && raw.length > 0) {
         setEntries(prev => {
           const merged = [...prev, ...raw];
-          if (merged.length > 500) return merged.slice(-500);
+          /* Keep the GUI in sync with the daemon ring (5000 entries).
+           * Older entries scroll off the back exactly as on the daemon side. */
+          if (merged.length > 5000) return merged.slice(-5000);
           return merged;
         });
         const maxSeq = Math.max(...raw.map((e: InspectEntry) => e.seq || 0));
@@ -106,7 +135,24 @@ export default function Inspect() {
     } catch (e) { console.error('CA generation error:', e); }
   }
 
-  const filtered = filter
+  /* Index responses by request key so we can both:
+   *   (a) show response status/size on each request row
+   *   (b) apply content-type / status filters against the *paired* response
+   * Key = `${domain}|${dst_port}|${ts_bucket}` (5s bucket for proximity) */
+  const respIndex = new Map<string, InspectEntry>();
+  for (const e of entries) {
+    if (e.is_request) continue;
+    const bucket = Math.floor(e.ts / 5);
+    respIndex.set(`${e.domain}|${e.dst_port}|${bucket}`,   e);
+    respIndex.set(`${e.domain}|${e.dst_port}|${bucket-1}`, e);
+  }
+  const pairResp = (req: InspectEntry): InspectEntry | undefined => {
+    const bucket = Math.floor(req.ts / 5);
+    return respIndex.get(`${req.domain}|${req.dst_port}|${bucket}`) ??
+           respIndex.get(`${req.domain}|${req.dst_port}|${bucket+1}`);
+  };
+
+  const textFiltered = filter
     ? entries.filter(e => {
         const f = filter.toLowerCase();
         return (e.domain || '').toLowerCase().includes(f) ||
@@ -116,8 +162,16 @@ export default function Inspect() {
       })
     : entries;
 
-  /* Pair requests/responses by domain+port+time proximity */
-  const requests = filtered.filter(e => e.is_request);
+  /* Request rows, filtered by content-type + status through their paired
+   * response. A request without a matching response is kept if status=all. */
+  const requests = textFiltered.filter(e => {
+    if (!e.is_request) return false;
+    if (ctypeFilter === 'all' && statusFilter === 'all') return true;
+    const resp = pairResp(e);
+    if (!resp) return statusFilter === 'all' && ctypeFilter === 'all';
+    return ctypeMatches(resp.content_type, ctypeFilter) &&
+           statusMatches(resp.status, statusFilter);
+  });
 
   return (
     <div className="flex h-full flex-col gap-3">
@@ -151,6 +205,33 @@ export default function Inspect() {
           placeholder="Filter by domain, URL, method..."
           className="w-64 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] placeholder-[#64748b] outline-none focus:border-[#6366f1]"
         />
+
+        <select
+          value={ctypeFilter}
+          onChange={e => setCtypeFilter(e.target.value as CtypeFilter)}
+          className="rounded-md border border-[#2d3348] bg-[#232733] px-2 py-1.5 text-xs text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+          title="Filter by response Content-Type"
+        >
+          <option value="all">all types</option>
+          <option value="json">JSON</option>
+          <option value="html">HTML</option>
+          <option value="xml">XML</option>
+          <option value="text">text/*</option>
+          <option value="other">other</option>
+        </select>
+
+        <select
+          value={statusFilter}
+          onChange={e => setStatusFilter(e.target.value as StatusFilter)}
+          className="rounded-md border border-[#2d3348] bg-[#232733] px-2 py-1.5 text-xs text-[#e2e8f0] outline-none focus:border-[#6366f1]"
+          title="Filter by HTTP status class"
+        >
+          <option value="all">all status</option>
+          <option value="2xx">2xx</option>
+          <option value="3xx">3xx</option>
+          <option value="4xx">4xx</option>
+          <option value="5xx">5xx</option>
+        </select>
 
         <button
           onClick={() => { setEntries([]); seqRef.current = 0; }}
@@ -204,13 +285,7 @@ export default function Inspect() {
                   </td>
                 </tr>
               ) : requests.map((e) => {
-                /* Find matching response */
-                const resp = filtered.find(r =>
-                  !r.is_request &&
-                  r.domain === e.domain &&
-                  r.dst_port === e.dst_port &&
-                  Math.abs(r.ts - e.ts) < 5
-                );
+                const resp = pairResp(e);
                 return (
                   <tr
                     key={e.seq}
@@ -288,10 +363,17 @@ export default function Inspect() {
             {/* Body */}
             {selected.body && (
               <div>
-                <h4 className="mb-1 text-xs font-semibold text-[#64748b]">
-                  Body ({selected.body_len || 0} bytes)
+                <h4 className="mb-1 flex items-center justify-between text-xs font-semibold text-[#64748b]">
+                  <span>Body ({selected.body_len || 0} bytes)</span>
+                  {selected.body_encoding_orig && (
+                    <span className={`text-[10px] ${selected.body_decoded ? 'text-[#22c55e]' : 'text-[#f59e0b]'}`}>
+                      {selected.body_decoded
+                        ? `decoded from ${selected.body_encoding_orig}`
+                        : `${selected.body_encoding_orig} (raw — decode failed)`}
+                    </span>
+                  )}
                 </h4>
-                <pre className="max-h-48 overflow-auto rounded bg-[#232733] p-2 text-[10px] text-[#e2e8f0] whitespace-pre-wrap break-all">
+                <pre className="max-h-72 overflow-auto rounded bg-[#232733] p-2 text-[10px] text-[#e2e8f0] whitespace-pre-wrap break-all">
                   {(() => {
                     try { return JSON.stringify(JSON.parse(selected.body), null, 2); }
                     catch { return selected.body; }

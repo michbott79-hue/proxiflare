@@ -22,6 +22,9 @@ pkg_check_modules(OPENSSL    REQUIRED openssl)
 pkg_check_modules(NFQ        REQUIRED libnetfilter_queue)
 pkg_check_modules(NFNETLINK  REQUIRED libnfnetlink)
 pkg_check_modules(LIBSSH2    REQUIRED libssh2)
+pkg_check_modules(ZLIB       REQUIRED zlib)
+pkg_check_modules(BROTLIDEC  REQUIRED libbrotlidec)
+pkg_check_modules(ZSTD       REQUIRED libzstd)
 
 # ── libargon2 (no pkg-config — manual search) ───────────────────────────────
 find_library(ARGON2_LIB NAMES argon2 REQUIRED)
@@ -56,6 +59,7 @@ set(DAEMON_SOURCES
     src/stats.c
     src/mitm.c
     src/http_parser.c
+    src/body_decode.c
     vendor/cJSON/cJSON.c
 )
 
@@ -71,6 +75,9 @@ target_include_directories(proxiflare-daemon PRIVATE
     ${NFQ_INCLUDE_DIRS}
     ${NFNETLINK_INCLUDE_DIRS}
     ${LIBSSH2_INCLUDE_DIRS}
+    ${ZLIB_INCLUDE_DIRS}
+    ${BROTLIDEC_INCLUDE_DIRS}
+    ${ZSTD_INCLUDE_DIRS}
     ${ARGON2_INCLUDE_DIR}
 )
 
@@ -90,6 +97,9 @@ target_link_libraries(proxiflare-daemon PRIVATE
     ${NFQ_LIBRARIES}
     ${NFNETLINK_LIBRARIES}
     ${LIBSSH2_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+    ${BROTLIDEC_LIBRARIES}
+    ${ZSTD_LIBRARIES}
     ${ARGON2_LIB}
     pthread
 )

@@ -1303,7 +1303,14 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
 
     /* ── dns_leak.enable ────────────────────────────────────────────────── */
     } else if (strcmp(method, "dns_leak.enable") == 0) {
-        cJSON *server_v = params ? cJSON_GetObjectItem(params, "dns_server") : NULL;
+        /* Accept either "dns_server" (internal) or "server" (what the GUI
+         * and ad-hoc IPC tests typically send). Falling back to 1.1.1.1
+         * when missing meant the user's chosen server was silently ignored. */
+        cJSON *server_v = NULL;
+        if (params) {
+            server_v = cJSON_GetObjectItem(params, "dns_server");
+            if (!server_v) server_v = cJSON_GetObjectItem(params, "server");
+        }
         const char *dns = (server_v && server_v->valuestring && server_v->valuestring[0])
                           ? server_v->valuestring : "1.1.1.1";
         if (pf_nft_dns_leak_protect(dns) == PF_OK) {

@@ -1,1 +1,23 @@
+# Build outputs
 daemon/build/
+gui/src-tauri/target/
+gui/dist/
+gui/node_modules/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code / Ruflo local state (non-portable)
+.claude-flow/
+.claude/
+.swarm/
+.mcp.json
+claude-flow.config.json
+CLAUDE.md.pre-ruflo.bak
+
+# Logs / tmp
+*.log
+*.tmp

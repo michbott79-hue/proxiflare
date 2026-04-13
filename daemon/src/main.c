@@ -45,7 +45,7 @@
  * Log ring buffer — last 500 entries, sequence-numbered for polling
  * ────────────────────────────────────────────────────────────────────────── */
 
-#define PF_LOG_RING_SIZE 500
+#define PF_LOG_RING_SIZE 2000
 
 static cJSON   *g_log_ring[PF_LOG_RING_SIZE];
 static int      g_log_ring_head  = 0;   /* next write position */

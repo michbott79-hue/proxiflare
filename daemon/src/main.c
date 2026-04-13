@@ -534,7 +534,47 @@ static int proxy_connect_for_tproxy(const char *dst_ip, int dst_port,
     }
 
     if (!rule || rule->action == PF_ACTION_DIRECT) {
+        /* Copy the rule name/id out before unlocking — we want it in the
+         * log entry. When rule==NULL (no match at all) we emit "direct"
+         * without a rule name. */
+        char direct_rule_name[64] = "";
+        if (rule) snprintf(direct_rule_name, sizeof(direct_rule_name), "%s", rule->name);
         pthread_rwlock_unlock(&ctx->ruleset_lock);
+
+        /* Log direct pass-through so the user can SEE that the app is
+         * being routed (just not through a proxy). This is the visibility
+         * piece Mich asked for: "voglio vedere anche le connessioni dirette
+         * così capisco che funziona". */
+        pf_log_info("tproxy: [direct] %s:%d (rule=%s)",
+                    (match_domain && match_domain[0]) ? match_domain : (dst_ip ? dst_ip : "?"),
+                    dst_port,
+                    direct_rule_name[0] ? direct_rule_name : "none");
+
+        cJSON *event = cJSON_CreateObject();
+        cJSON_AddNumberToObject(event, "ts", (double)time(NULL));
+        cJSON_AddStringToObject(event, "app", "");
+        cJSON_AddStringToObject(event, "rule", direct_rule_name);
+        cJSON_AddStringToObject(event, "proxy", "direct");
+        cJSON_AddNumberToObject(event, "proxy_id", 0);
+        cJSON_AddStringToObject(event, "domain", match_domain ? match_domain : "");
+        cJSON_AddStringToObject(event, "dst_ip", dst_ip ? dst_ip : "");
+        cJSON_AddNumberToObject(event, "dst_port", (double)dst_port);
+        cJSON_AddStringToObject(event, "action", "DIRECT");
+        cJSON_AddNumberToObject(event, "success", 1);
+        cJSON_AddNumberToObject(event, "bytes_tx", 0);
+        cJSON_AddNumberToObject(event, "bytes_rx", 0);
+        cJSON_AddNumberToObject(event, "latency_ms", 0);
+        pf_ipc_broadcast_log(&ctx->ipc, event);
+        cJSON *copy = cJSON_Duplicate(event, 1);
+        if (copy) {
+            cJSON_AddNumberToObject(copy, "seq", (double)(++g_log_seq));
+            if (g_log_ring[g_log_ring_head])
+                cJSON_Delete(g_log_ring[g_log_ring_head]);
+            g_log_ring[g_log_ring_head] = copy;
+            g_log_ring_head = (g_log_ring_head + 1) % PF_LOG_RING_SIZE;
+            if (g_log_ring_count < PF_LOG_RING_SIZE) g_log_ring_count++;
+        }
+        cJSON_Delete(event);
         return -1;
     }
 

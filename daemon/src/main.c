@@ -1015,14 +1015,23 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
                 r.enabled = cJSON_IsTrue(v) ? 1 : 0;
 
             if (pf_config_rule_update(&ctx->config, &r) == PF_OK) {
-                /* Sync cgroup + nft mark for app-based rules */
+                /* Sync cgroup + nft mark for app-based rules.
+                 *
+                 * Full tear-down + re-create on every edit. Reasons:
+                 *  1. Avoid nft mark duplication (add_cgroup_mark is an
+                 *     "add rule" without dedup).
+                 *  2. Force existing Firefox/HTTP2 keep-alive connections
+                 *     of this app to break, so they re-establish and pick
+                 *     up the new domain/ip/port filters immediately — no
+                 *     more "devo fare off/on perché non si applica". */
                 if (r.app_path[0] && r.enabled && r.action != PF_ACTION_DIRECT) {
+                    pf_nft_remove_cgroup_mark((int)r.id);
+                    pf_cgroup_remove_rule((int)r.id);
                     pf_cgroup_create_rule((int)r.id);
                     pf_nft_add_cgroup_mark((int)r.id);
-                    /* Re-sync: pick up running PIDs that match the (possibly
-                     * changed) app_path. pf_cgroup_assign_pid is a no-op if
-                     * the PID is already in the cgroup. */
                     pf_cgroup_assign_running_pids((int)r.id, r.app_path);
+                    pf_log_info("rule.edit: re-applied rule_%d live (app=%s)",
+                                (int)r.id, r.app_path);
                 } else {
                     /* Disabled or no app — remove cgroup mark */
                     pf_nft_remove_cgroup_mark((int)r.id);

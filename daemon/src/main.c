@@ -102,6 +102,10 @@ static cJSON   *g_inspect_ring[PF_INSPECT_RING_SIZE];
 static int      g_inspect_ring_head  = 0;
 static int      g_inspect_ring_count = 0;
 static uint64_t g_inspect_seq        = 0;
+/* Diagnostic counters — surfaced in inspect.status so the GUI can explain
+ * "why is the ring empty" without needing journalctl. */
+static uint64_t g_inspect_skipped_h2 = 0;  /* h2 CLIENT_PREFACE / frames seen */
+static uint64_t g_inspect_parse_fail = 0;  /* bytes received but not parseable */
 
 /* Pre-buffer noise filters. Keep the ring dominated by user-meaningful
  * traffic (API, HTML, app XHR) rather than ad/tracker/asset bursts.
@@ -170,6 +174,18 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
      * already but response-side also benefits from the early return. */
     if (conn->domain[0] && domain_is_tracker(conn->domain)) return;
 
+    /* HTTP/2 CLIENT_PREFACE detection. Browsers that negotiated h2 via ALPN
+     * send exactly these 24 magic bytes before any frames. Our h1.1 parser
+     * would see this as garbage and silently drop the connection. Count
+     * these so the UI can surface an actionable hint ("X% of traffic is
+     * HTTP/2 — native h2 parsing not yet implemented"). */
+    static const uint8_t H2_PREFACE[24] =
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if (is_request && len >= 24 && memcmp(data, H2_PREFACE, 24) == 0) {
+        g_inspect_skipped_h2++;
+        return;
+    }
+
     pf_http_msg_t msg;
     int rc;
 
@@ -178,7 +194,13 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
     else
         rc = pf_http_parse_response((const char *)data, len, &msg);
 
-    if (rc != 0) return; /* not a complete HTTP message (yet) */
+    if (rc != 0) {
+        /* Not a complete HTTP/1.1 message. Could be a partial TCP segment,
+         * an h2 DATA/HEADERS frame on a pre-prefaced stream, or some other
+         * non-HTTP application data. Count so the user can tell. */
+        g_inspect_parse_fail++;
+        return;
+    }
 
     /* Post-parse drop: static asset content types on responses. Image/font
      * traffic has no debugging value and floods the ring on page loads. */
@@ -1596,14 +1618,40 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         cJSON_AddStringToObject(resp, "result", "ok");
         pf_log_info("mitm: inspection DISABLED");
 
+    /* ── quic_block.enable / disable / status ───────────────────────────── *
+     * Toggle blocking of UDP:443 from the proxiflare cgroup, persisted in
+     * config. Default is enabled (see daemon startup) — needed so capture
+     * works out-of-the-box on modern sites that otherwise negotiate HTTP/3.
+     * ─────────────────────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "quic_block.enable") == 0) {
+        if (pf_nft_block_quic() == PF_OK) {
+            pf_config_set(&ctx->config, "quic_block_enabled", "true");
+            cJSON_AddStringToObject(resp, "result", "ok");
+        } else {
+            cJSON_AddStringToObject(resp, "error", "nft rule failed");
+        }
+    } else if (strcmp(method, "quic_block.disable") == 0) {
+        pf_nft_unblock_quic();
+        pf_config_set(&ctx->config, "quic_block_enabled", "false");
+        cJSON_AddStringToObject(resp, "result", "ok");
+    } else if (strcmp(method, "quic_block.status") == 0) {
+        char val[8] = "true";
+        pf_config_get(&ctx->config, "quic_block_enabled", val, sizeof(val));
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddBoolToObject(r, "enabled", strcmp(val, "false") != 0);
+        cJSON_AddItemToObject(resp, "result", r);
+
     /* ── inspect.status ─────────────────────────────────────────────────── */
     } else if (strcmp(method, "inspect.status") == 0) {
         cJSON *r = cJSON_CreateObject();
-        cJSON_AddBoolToObject(r, "enabled", ctx->mitm.enabled ? 1 : 0);
-        cJSON_AddBoolToObject(r, "ca_installed", ctx->mitm.ca_key ? 1 : 0);
-        cJSON_AddStringToObject(r, "ca_cert_path", PF_MITM_CA_CERT_PATH);
-        cJSON_AddNumberToObject(r, "cached_certs", ctx->mitm.cache_count);
-        cJSON_AddItemToObject(resp, "result", r);
+        cJSON_AddBoolToObject  (r, "enabled",        ctx->mitm.enabled ? 1 : 0);
+        cJSON_AddBoolToObject  (r, "ca_installed",   ctx->mitm.ca_key ? 1 : 0);
+        cJSON_AddStringToObject(r, "ca_cert_path",   PF_MITM_CA_CERT_PATH);
+        cJSON_AddNumberToObject(r, "cached_certs",   ctx->mitm.cache_count);
+        cJSON_AddNumberToObject(r, "ring_count",     g_inspect_ring_count);
+        cJSON_AddNumberToObject(r, "skipped_h2",     (double)g_inspect_skipped_h2);
+        cJSON_AddNumberToObject(r, "parse_failures", (double)g_inspect_parse_fail);
+        cJSON_AddItemToObject  (resp, "result", r);
 
     /* ── inspect.generate_ca ────────────────────────────────────────────── */
     } else if (strcmp(method, "inspect.generate_ca") == 0) {
@@ -2086,6 +2134,16 @@ int main(int argc, char *argv[])
         if (pf_nft_setup_tproxy(PF_TPROXY_PORT) != PF_OK)
             pf_log_warn("nft_setup_tproxy failed");
         pf_log_info("nftables rules installed");
+
+        /* QUIC block — default-on so capture works out of the box on modern
+         * sites. Can be toggled off at runtime via IPC quic_block.disable. */
+        {
+            char quic_block[8] = "true";
+            pf_config_get(&ctx->config, "quic_block_enabled", quic_block,
+                          (int)sizeof(quic_block));
+            if (strcmp(quic_block, "false") != 0)
+                pf_nft_block_quic();
+        }
 
         /* Restore DNS leak protection if it was active before daemon restart.
          * Two modes:

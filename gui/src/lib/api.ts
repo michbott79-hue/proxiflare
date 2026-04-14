@@ -169,6 +169,16 @@ export async function dnsLeakStatus(): Promise<{ enabled: boolean; mode: DnsMode
   };
 }
 
+// ── QUIC block (forces TCP+TLS fallback for HTTP/3 sites) ───────────────────
+
+export async function quicBlockEnable():  Promise<void> { return invoke<void>('quic_block_enable'); }
+export async function quicBlockDisable(): Promise<void> { return invoke<void>('quic_block_disable'); }
+export async function quicBlockStatus(): Promise<{ enabled: boolean }> {
+  const raw = await invoke<any>('quic_block_status');
+  const r = raw?.result ?? raw ?? {};
+  return { enabled: !!r.enabled };
+}
+
 // ── Log polling ─────────────────────────────────────────────────────────────
 
 export interface LogEntryRaw {

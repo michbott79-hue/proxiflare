@@ -127,6 +127,11 @@ int pf_nft_init(void)
          * increment but traffic still times out). */
         "        type nat hook output priority -100; policy accept;\n"
         "    }\n"
+        "    chain output_filter {\n"
+        /* Filter chain for per-cgroup drops (e.g. QUIC blocking to force
+         * TCP+TLS fallback so the MITM engine can intercept). */
+        "        type filter hook output priority 0; policy accept;\n"
+        "    }\n"
         "}\n";
 
     if (nft_run(main_table) != PF_OK) {
@@ -397,6 +402,51 @@ int pf_nft_dns_via_proxy(int local_port)
     }
 
     pf_log_info("nft: DNS via proxy active → local resolver :%d", local_port);
+    return PF_OK;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * pf_nft_block_quic — REJECT UDP:443 from the proxiflare cgroup.
+ *
+ * Modern browsers (Firefox, Chrome) speak HTTP/3 over QUIC on UDP:443 for
+ * a growing share of sites. QUIC bypasses TPROXY entirely (it only handles
+ * TCP), so those connections are invisible to our MITM engine — capture
+ * panel looks empty even though the page is loading.
+ *
+ * Blocking UDP:443 from the cgroup forces the browser to fall back to
+ * HTTPS-over-TCP within ~100 ms. Critically we use REJECT (with ICMP
+ * port-unreachable) rather than DROP: Firefox's alt-svc fast-fallback
+ * timer fires on ICMP rejection, whereas DROP leaves the browser waiting
+ * on the UDP timeout for multiple seconds.
+ *
+ * Per RFC 9114, 443 is the default QUIC port; other UDP destinations are
+ * left untouched. Scope is the proxiflare cgroup only — system-wide QUIC
+ * is not affected.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int pf_nft_block_quic(void)
+{
+    /* Idempotent: wipe any prior QUIC-block rule first. */
+    nft_delete_by_comment("inet", "proxiflare", "output_filter", "pf_block_quic");
+
+    const char *cmd =
+        "add rule inet proxiflare output_filter "
+        "socket cgroupv2 level 1 \"proxiflare\" "
+        "meta l4proto udp udp dport 443 "
+        "counter reject with icmpx type admin-prohibited "
+        "comment \"pf_block_quic\"\n";
+    if (nft_run(cmd) != PF_OK) {
+        pf_log_error("nft: block_quic failed");
+        return PF_ERR;
+    }
+    pf_log_info("nft: QUIC blocked for proxiflare cgroup (forces TCP+TLS fallback)");
+    return PF_OK;
+}
+
+int pf_nft_unblock_quic(void)
+{
+    nft_delete_by_comment("inet", "proxiflare", "output_filter", "pf_block_quic");
+    pf_log_info("nft: QUIC block removed");
     return PF_OK;
 }
 

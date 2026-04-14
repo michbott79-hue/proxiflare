@@ -50,6 +50,9 @@ interface InspectStatus {
   ca_installed: boolean;
   ca_cert_path: string;
   cached_certs: number;
+  ring_count?: number;
+  skipped_h2?: number;
+  parse_failures?: number;
 }
 
 const METHOD_COLORS: Record<string, string> = {
@@ -358,6 +361,16 @@ export default function Inspect() {
           <span>{entries.length} entries</span>
           {status?.cached_certs !== undefined && (
             <span>{status.cached_certs} cached certs</span>
+          )}
+          {!!status?.skipped_h2 && (
+            <span className="text-[#f59e0b]" title="HTTP/2 traffic skipped — native h2 parsing not yet implemented. Make sure QUIC block is on and server accepts ALPN http/1.1.">
+              h2 skipped: {status.skipped_h2}
+            </span>
+          )}
+          {!!status?.parse_failures && (
+            <span className="text-[#94a3b8]" title="Bytes received but not parseable as HTTP/1.1 — h2 frames, partial TCP segments, or non-HTTP protocols.">
+              parse-fail: {status.parse_failures}
+            </span>
           )}
         </div>
       </div>

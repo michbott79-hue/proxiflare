@@ -261,6 +261,23 @@ pub fn dns_leak_status(client: State<DaemonClient>) -> Result<Value, String> {
     client.send_request("dns_leak.status", json!({}))
 }
 
+// ── QUIC block ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn quic_block_enable(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("quic_block.enable", json!({}))
+}
+
+#[tauri::command]
+pub fn quic_block_disable(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("quic_block.disable", json!({}))
+}
+
+#[tauri::command]
+pub fn quic_block_status(client: State<DaemonClient>) -> Result<Value, String> {
+    client.send_request("quic_block.status", json!({}))
+}
+
 // ── Inspect (MITM) ──────────────────────────────────────────────────────────
 
 #[tauri::command]

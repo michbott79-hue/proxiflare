@@ -9,6 +9,58 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [0.3.0-alpha] — 2026-04-14
+
+### Added — capture that actually works on 2026 sites
+
+Background. Diagnosis revealed the real cause of the "panel empty while
+the browser is obviously fetching" symptom on sites like DAZN, banks,
+and news backends:
+
+1. **QUIC (HTTP/3)** — Firefox/Chrome speak HTTP/3 over UDP:443 for a
+   growing share of sites (alt-svc cached). TPROXY only handles TCP, so
+   QUIC connections bypass our MITM engine entirely — invisible.
+2. **HTTP/2 server-side** — ~85% of 2026 traffic is HTTP/2+. Our
+   hand-rolled HTTP/1.1 parser chokes silently on h2 frames (the first
+   24 bytes of any h2 session are the fixed CLIENT_PREFACE
+   `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`).
+
+Measurement on a real browsing session before the fix:
+`823 TLS handshakes vs 500 captured entries` — ~40% of intercepted
+streams were silently dropped.
+
+Fixes in this release:
+
+- **QUIC blocking** (`pf_nft_block_quic` in daemon/src/nft.c). New
+  `output_filter` chain in the `inet proxiflare` table, scoped to the
+  proxiflare cgroup, REJECTs UDP:443 with ICMP admin-prohibited. REJECT
+  (not DROP) triggers Firefox's alt-svc fast-fallback timer → browser
+  falls back to TCP+TLS in ~100 ms instead of waiting on the UDP
+  timeout. Enabled by default on startup; persisted in config under
+  `quic_block_enabled`. IPC toggle:
+  `quic_block.enable` / `.disable` / `.status`.
+- **HTTP/2 CLIENT_PREFACE detection** in `on_inspect_data`. When the
+  browser and proxy negotiate `h2` via ALPN, the stream opens with the
+  24-byte magic preface. We now detect that and increment a
+  `skipped_h2` counter instead of feeding it to the h1.1 parser where
+  it would silently fail.
+- **Diagnostic counters surfaced in `inspect.status`**: `ring_count`,
+  `skipped_h2`, `parse_failures`. GUI toolbar shows these next to the
+  cached-certs count so the user can see exactly why the ring is
+  underpopulated — and whether the fix is needed yet (native h2 parser
+  via nghttp2 is the next step, tracked separately).
+
+### Deferred to a follow-up release
+- **Native HTTP/2 parsing via nghttp2** on the server-facing leg.
+  Needed for full capture of the ~50% of modern sites whose CDN/origin
+  insists on h2 frames even when we offer `http/1.1` via ALPN.
+  Architecture: `nghttp2_session_client_new` on the upstream SSL, use
+  `on_header_cb` / `on_data_chunk_cb` to reconstruct virtual
+  HTTP/1.1-shaped messages for our existing parser+capture path.
+  Estimated 1.5-2 days of focused work.
+
+---
+
 ## [0.2.3-alpha] — 2026-04-14
 
 ### Fixed — GUI hang "ProxiFlare is not responding"

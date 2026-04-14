@@ -9,6 +9,48 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [0.4.1-alpha] — 2026-04-14
+
+### Fixed — 35× speedup on captured traffic (DAZN, streaming)
+
+A bug in the new async capture queue from 0.4.0 made the capture worker
+drain at most one batch per producer signal — with heavy producers (DAZN
+body chunks) this accumulated latency on the relay thread's mutex wait
+inside `pf_capture_queue_push`, collapsing effective throughput.
+
+Root cause: `pf_capture_queue_drain()` did its own blocking
+`read(eventfd)` before pulling messages. The consumer's outer loop was:
+
+```
+worker_main():
+    read(eventfd)       // 1 signal consumed
+    for(;;) drain()     // drain ALSO reads eventfd → blocks on empty
+```
+
+So even when the queue had dozens of messages, drain would consume one
+eventfd signal, pull up to 64 messages, then on the next iteration
+block on the eventfd for the next producer signal — one batch per
+signal instead of draining until empty.
+
+Fix: remove the `read(eventfd)` from `pf_capture_queue_drain()`.
+Eventfd is a pure wake signal owned by the consumer's outer loop; the
+consumer reads it once, then calls drain() repeatedly until it returns
+0, and only then blocks on eventfd for the next wake.
+
+Measured impact on a DAZN full-page fetch via residential IT proxy:
+
+| Mode          | 0.4.0         | 0.4.1         |
+|---------------|---------------|---------------|
+| inspect off   | 95 KB / 0.24s | 95 KB / 0.22s |
+| inspect on    | 89 KB / 10.0s | 95 KB / 0.28s |
+
+Capture-on overhead is now ~15% vs inspect-off, down from 44×.
+
+Version bump 0.4.0 → 0.4.1 (patch) across tauri.conf.json,
+Cargo.toml, proxiflare.h, CHANGELOG.md.
+
+---
+
 ## [0.4.0-alpha] — 2026-04-14
 
 Major capture architecture rework + professional Inspect UX.

@@ -72,11 +72,12 @@ int pf_capture_queue_drain(pf_capture_queue_t *q,
 {
     if (!q || !out || max <= 0) return 0;
 
-    /* Consume the eventfd counter once per drain, regardless of how many
-     * messages we pull — the count+drain is decoupled by design. */
-    uint64_t discard;
-    ssize_t rd = read(q->eventfd, &discard, sizeof(discard));
-    (void)rd;
+    /* NOTE: we do NOT read the eventfd here. The eventfd is a pure wake
+     * signal owned by the consumer's outer loop — the consumer reads it
+     * once, then keeps calling drain() until we return 0. Reading the
+     * eventfd inside drain would block the consumer when the queue is
+     * empty, which in turn blocks producers waiting for the mutex
+     * inside push(), collapsing the whole point of the decoupling. */
 
     int got = 0;
     pthread_mutex_lock(&q->lock);

@@ -365,13 +365,12 @@ int pf_tproxy_relay(pf_tproxy_t *tp, int conn_idx)
 
     uint8_t buf[PF_BUF_SIZE];
 
-    /* client → proxy (request direction) */
+    /* client → proxy (request direction) — write FIRST, capture AFTER. The
+     * inspect callback only enqueues a heap copy (microseconds), but doing
+     * it after the write guarantees peer latency is never gated on capture
+     * under any condition (malloc pressure, worker backlog, etc.). */
     ssize_t n = relay_read(conn, 1, buf, sizeof(buf));
     if (n > 0) {
-        /* Inspect callback for request data */
-        if (conn->inspect && g_inspect_cb)
-            g_inspect_cb(buf, (size_t)n, 1, conn, g_inspect_userdata);
-
         ssize_t written = 0;
         while (written < n) {
             ssize_t w = relay_write(conn, 0, buf + written, (size_t)(n - written));
@@ -383,18 +382,17 @@ int pf_tproxy_relay(pf_tproxy_t *tp, int conn_idx)
             written += w;
         }
         conn->bytes_tx += (uint64_t)n;
+
+        if (conn->inspect && g_inspect_cb)
+            g_inspect_cb(buf, (size_t)n, 1, conn, g_inspect_userdata);
     } else {
         int rc = relay_check_err(conn, 1, n);
         if (rc < 0) { pf_tproxy_close_conn(tp, conn_idx); return PF_ERR; }
     }
 
-    /* proxy → client (response direction) */
+    /* proxy → client (response direction) — same ordering: write then capture. */
     n = relay_read(conn, 0, buf, sizeof(buf));
     if (n > 0) {
-        /* Inspect callback for response data */
-        if (conn->inspect && g_inspect_cb)
-            g_inspect_cb(buf, (size_t)n, 0, conn, g_inspect_userdata);
-
         ssize_t written = 0;
         while (written < n) {
             ssize_t w = relay_write(conn, 1, buf + written, (size_t)(n - written));
@@ -406,6 +404,9 @@ int pf_tproxy_relay(pf_tproxy_t *tp, int conn_idx)
             written += w;
         }
         conn->bytes_rx += (uint64_t)n;
+
+        if (conn->inspect && g_inspect_cb)
+            g_inspect_cb(buf, (size_t)n, 0, conn, g_inspect_userdata);
     } else {
         int rc = relay_check_err(conn, 0, n);
         if (rc < 0) { pf_tproxy_close_conn(tp, conn_idx); return PF_ERR; }

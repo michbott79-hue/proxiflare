@@ -6,22 +6,30 @@
 #include <openssl/x509.h>
 #include <openssl/evp.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Limits
  * ────────────────────────────────────────────────────────────────────────── */
+/* Must be a power of 2 — open-addressing hash table uses (size-1) as mask. */
 #define PF_MITM_CERT_CACHE_SIZE  256
 #define PF_MITM_CA_KEY_PATH      "/var/lib/proxiflare/ca.key"
 #define PF_MITM_CA_CERT_PATH     "/var/lib/proxiflare/ca.crt"
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Cert cache entry
+ * Cert cache entry — slot in the open-addressing hash table
+ *
+ * Keyed by lowercased SNI hostname (FNV-1a 64-bit hash, linear probing).
+ * last_used is a monotonic counter (g_tick), not wall-clock time; used for
+ * LRU eviction when a probe chain is exhausted.
  * ────────────────────────────────────────────────────────────────────────── */
 typedef struct {
     char         domain[PF_DOMAIN_MAX + 1];
     X509        *cert;
     EVP_PKEY    *key;
-    time_t       created;
+    uint64_t     last_used;   /* LRU counter — higher = more recently used */
+    bool         used;        /* slot occupied?                            */
 } pf_cert_cache_entry_t;
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -37,7 +45,8 @@ typedef struct {
     SSL_CTX     *server_ctx;   /* template — cert set per-connection via SNI callback */
     SSL_CTX     *client_ctx;   /* connects to real servers */
 
-    /* Dynamic cert cache — protected by cache_lock (accessed from handshake threads) */
+    /* Cert cache — open-addressing hash table, PF_MITM_CERT_CACHE_SIZE slots.
+     * Protected by cache_lock. cache_count tracks occupied slots. */
     pf_cert_cache_entry_t cache[PF_MITM_CERT_CACHE_SIZE];
     int          cache_count;
     pthread_mutex_t cache_lock;

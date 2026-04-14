@@ -9,6 +9,65 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [0.4.0-alpha] — 2026-04-14
+
+Major capture architecture rework + professional Inspect UX.
+
+### Added — async capture architecture (zero-overhead hot path)
+- New `daemon/src/capture_queue.{c,h}`: MPSC ring (4096 slots) guarded by a
+  short-held mutex, woken via `eventfd`. Producers (TPROXY relay threads)
+  push heap-allocated `pf_capture_msg_t` with the raw bytes inline after
+  the struct; consumer drains in batches of 64. On overflow the oldest
+  undequeued message is dropped and a `dropped` counter is bumped —
+  capture fidelity is sacrificed to keep the relay thread non-blocking.
+- New `daemon/src/capture_worker.{c,h}`: single consumer thread that
+  blocks on the eventfd, drains the queue, and invokes a user-supplied
+  processing callback. Cleanly joined at daemon shutdown.
+- **`on_inspect_data` is now a thin producer** — validates, rejects
+  tracker domains, snapshots bytes + connection metadata, enqueues.
+  Microseconds on the relay path.
+- **`capture_process_msg` is the consumer** — runs on the worker thread.
+  Does the original synchronous work: HTTP/2 preface detection, HTTP/1.1
+  parse, gzip/br/zstd decompression, cJSON construction, insertion into
+  the inspect ring under `g_inspect_ring_lock`.
+- **`tproxy.c` relay reordered**: peer write happens BEFORE the inspect
+  callback, so peer latency is never gated on capture under any
+  condition (malloc pressure, worker backlog, full queue, etc.).
+
+Expected effect: DAZN/streaming pages no longer hang when capture is
+enabled. The relay thread's work is bounded by `malloc+memcpy+mutex` —
+~1 μs per chunk.
+
+### Added — Copy as code (10 target languages)
+- New `gui/src/lib/snippet-gen/` module with HAR-shaped intermediate
+  (`har.ts`) and per-language generators for: cURL, Python requests,
+  Python httpx, Node fetch, Node axios, PHP cURL, PHP Guzzle, Go
+  net/http, Rust reqwest, Java OkHttp.
+- Auto-strips `Content-Length`, `Content-Encoding`, `Transfer-Encoding`,
+  `Host`, `Connection`, and all `:*` h2 pseudo-headers before export.
+- Binary body detection via null-byte heuristic on first 512 chars →
+  emits base64 + decode call in the target language.
+- Proper escaping per language: bash single-quote `'\''` trick, Python
+  `\xNN`, Node backticks, PHP `<<<'EOD'` nowdoc, Go backtick concat,
+  Rust `r#""#` with dynamic hash count, Java `\"` + concat.
+- TLS-verify-off flag commented and disabled by default in every
+  snippet so a copy-paste doesn't silently accept bad certs.
+- Inspect detail panel: new "Copy as ▼" dropdown matching the existing
+  dark-theme dropdowns; inline 2 s "Copied as X!" toast.
+
+### Changed — MITM perf polish
+- **Cert cache is now O(1) hash** (open addressing, FNV-1a 64, 16-slot
+  probe window). Old implementation was a linear array with
+  `memmove`-based LRU eviction — dominant on first DAZN page load which
+  opens 50+ unique hostnames. API unchanged.
+- **TLS session resumption** enabled on the client-facing (browser-side)
+  `SSL_CTX`: `SSL_SESS_CACHE_SERVER` + 1024-slot cache, session ID
+  context set, `SSL_CTX_set_num_tickets(2)` for TLS 1.3 ticket
+  issuance. Subsequent handshakes from the same Firefox session drop
+  from ~5 ms to <0.5 ms. Resumption logged in the `wrap_client` path.
+
+---
+
 ## [0.3.0-alpha] — 2026-04-14
 
 ### Added — capture that actually works on 2026 sites

@@ -60,6 +60,8 @@ set(DAEMON_SOURCES
     src/mitm.c
     src/http_parser.c
     src/body_decode.c
+    src/capture_queue.c
+    src/capture_worker.c
     vendor/cJSON/cJSON.c
 )
 

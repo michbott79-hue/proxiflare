@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import * as api from '../lib/api';
+import { TARGETS, generateSnippet } from '../lib/snippet-gen/index.ts';
+import type { TargetId } from '../lib/snippet-gen/index.ts';
 
 interface InspectEntry {
   seq: number;
@@ -83,8 +85,11 @@ export default function Inspect() {
   const [ctypeOpen,    setCtypeOpen]    = useState(false);
   const [statusOpen,   setStatusOpen]   = useState(false);
   const [toggling, setToggling] = useState(false);
+  const [copyOpen,  setCopyOpen]  = useState(false);
+  const [copyToast, setCopyToast] = useState('');
   const ctypeRef  = useRef<HTMLDivElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
+  const copyRef   = useRef<HTMLDivElement>(null);
   const seqRef = useRef(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollInFlight = useRef(false);   /* drop poll() calls while one is pending */
@@ -95,6 +100,7 @@ export default function Inspect() {
     function handleClick(e: MouseEvent) {
       if (ctypeRef.current  && !ctypeRef.current.contains(e.target as Node))  setCtypeOpen(false);
       if (statusRef.current && !statusRef.current.contains(e.target as Node)) setStatusOpen(false);
+      if (copyRef.current   && !copyRef.current.contains(e.target as Node))   setCopyOpen(false);
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
@@ -208,6 +214,21 @@ export default function Inspect() {
       await loadStatus();
     } catch (e) { console.error('CA generation error:', e); }
   }
+
+  const handleCopyAs = useCallback((targetId: TargetId) => {
+    if (!selected) return;
+    setCopyOpen(false);
+    try {
+      const snippet = generateSnippet(targetId, selected);
+      navigator.clipboard.writeText(snippet).then(() => {
+        const label = TARGETS.find(t => t.id === targetId)?.label ?? targetId;
+        setCopyToast(`Copied as ${label}!`);
+        setTimeout(() => setCopyToast(''), 2000);
+      });
+    } catch (err) {
+      console.error('Snippet generation error:', err);
+    }
+  }, [selected]);
 
   /* Index responses by request key so we can both:
    *   (a) show response status/size on each request row
@@ -499,6 +520,39 @@ export default function Inspect() {
                 </pre>
               </div>
             )}
+
+            {/* Copy as code snippet */}
+            <div className="mt-3 border-t border-[#2d3348] pt-3">
+              <div className="flex items-center gap-2">
+                <div className="relative" ref={copyRef}>
+                  <button
+                    onClick={() => setCopyOpen(v => !v)}
+                    className="flex items-center gap-2 rounded-md border border-[#2d3348] bg-[#232733] px-3 py-1.5 text-xs text-[#e2e8f0] transition-colors hover:border-[#6366f1]"
+                  >
+                    <span>Copy as…</span>
+                    <svg className="h-3 w-3 text-[#64748b]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                  {copyOpen && (
+                    <div className="absolute left-0 z-50 mt-1 min-w-[180px] rounded-md border border-[#2d3348] bg-[#1a1d27] py-1 shadow-lg">
+                      {TARGETS.map(t => (
+                        <button
+                          key={t.id}
+                          onClick={() => handleCopyAs(t.id)}
+                          className="flex w-full items-center px-3 py-1.5 text-left text-xs text-[#e2e8f0] transition-colors hover:bg-[#2d3348]"
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {copyToast && (
+                  <span className="text-[10px] text-[#22c55e] transition-opacity">{copyToast}</span>
+                )}
+              </div>
+            </div>
 
             {/* Connection info */}
             <div className="mt-3 border-t border-[#2d3348] pt-3">

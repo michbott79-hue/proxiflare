@@ -15,6 +15,32 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
+#include <stdint.h>
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Hash-table helpers for the cert cache
+ *
+ * Hash: FNV-1a 64-bit over the lowercased domain string.
+ * Ref: http://www.isthe.com/chongo/tech/comp/fnv/index.html#FNV-1a
+ *
+ * Monotonic tick counter — incremented on every cache hit or insert so that
+ * last_used carries a strictly-increasing sequence rather than wall-clock
+ * time (avoids clock_gettime overhead inside the hot path).
+ * ────────────────────────────────────────────────────────────────────────── */
+#define CACHE_MASK  (PF_MITM_CERT_CACHE_SIZE - 1u)
+#define CACHE_PROBE 16   /* max linear-probe steps before forcing eviction */
+
+static uint64_t g_tick = 0;   /* protected by cache_lock */
+
+/* FNV-1a 64-bit over a NUL-terminated string lowercased on the fly. */
+static uint64_t fnv1a64_lower(const char *s)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (; *s; s++)
+        h = (h ^ (uint64_t)(unsigned char)tolower((unsigned char)*s))
+            * UINT64_C(1099511628211);
+    return h;
+}
 
 /* Cap TLS handshake to 5s — a stalled peer must not hold the MITM thread
  * forever. Without this a client that never finishes ClientHello pins the
@@ -349,6 +375,39 @@ int pf_mitm_init(pf_mitm_t *m)
      * which our HTTP/1.1 parser cannot decode. */
     SSL_CTX_set_alpn_select_cb(m->server_ctx, mitm_alpn_select_cb, NULL);
 
+    /* ── TLS session resumption (server-side / Firefox-facing leg only) ──
+     *
+     * SSL_CTX_set_session_cache_mode:
+     *   SSL_SESS_CACHE_SERVER enables the internal OpenSSL session cache for
+     *   incoming (server-side) connections.  Subsequent handshakes from the
+     *   same client can present a session-id (TLS 1.2) or a session ticket
+     *   (TLS 1.3) and skip the full key-exchange, dropping handshake time
+     *   from ~5 ms to <0.5 ms.
+     *   man SSL_CTX_set_session_cache_mode(3)
+     *
+     * SSL_CTX_set_session_id_context:
+     *   Required for the server cache to work correctly — without it OpenSSL
+     *   refuses to resume sessions.  A constant ASCII label is enough.
+     *   man SSL_CTX_set_session_id_context(3)
+     *
+     * SSL_CTX_set_num_tickets:
+     *   Controls how many TLS 1.3 NewSessionTicket messages are sent after
+     *   the handshake.  2 is enough for both 0-RTT and 1-RTT resumption.
+     *   man SSL_CTX_set_num_tickets(3)
+     *
+     * NOTE: only applied to server_ctx (Firefox-facing).  client_ctx is
+     * intentionally left unchanged — resuming the outbound (proxy-facing)
+     * leg is not in scope and would require per-domain session storage.
+     */
+    SSL_CTX_set_session_cache_mode(m->server_ctx, SSL_SESS_CACHE_SERVER);
+    SSL_CTX_sess_set_cache_size(m->server_ctx, 1024);
+    {
+        static const unsigned char sid_ctx[] = "proxiflare-mitm";
+        SSL_CTX_set_session_id_context(m->server_ctx,
+                                       sid_ctx, sizeof(sid_ctx) - 1);
+    }
+    SSL_CTX_set_num_tickets(m->server_ctx, 2);
+
     /* Client SSL context (for connecting to real servers) */
     m->client_ctx = SSL_CTX_new(TLS_client_method());
     if (!m->client_ctx) {
@@ -373,7 +432,9 @@ void pf_mitm_close(pf_mitm_t *m)
     if (!m) return;
 
     pthread_mutex_lock(&m->cache_lock);
-    for (int i = 0; i < m->cache_count; i++) {
+    /* Scan all slots — hash table may have occupied entries anywhere. */
+    for (int i = 0; i < PF_MITM_CERT_CACHE_SIZE; i++) {
+        if (!m->cache[i].used) continue;
         if (m->cache[i].cert) X509_free(m->cache[i].cert);
         if (m->cache[i].key)  EVP_PKEY_free(m->cache[i].key);
     }
@@ -390,7 +451,16 @@ void pf_mitm_close(pf_mitm_t *m)
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * pf_mitm_get_cert — cached cert lookup/generation
+ * pf_mitm_get_cert — O(1) cached cert lookup/generation
+ *
+ * Storage: open-addressing hash table (PF_MITM_CERT_CACHE_SIZE power-of-2
+ * slots), keyed by lowercased SNI hostname, FNV-1a 64-bit hash, linear
+ * probing up to CACHE_PROBE steps.
+ *
+ * LRU eviction: when no empty slot is found within the probe window, scan
+ * the same probe window for the entry with the smallest last_used tick and
+ * evict it.  This keeps eviction bounded to CACHE_PROBE iterations (never
+ * the full table) while preserving LRU semantics within the probe chain.
  * ────────────────────────────────────────────────────────────────────────── */
 
 int pf_mitm_get_cert(pf_mitm_t *m, const char *domain,
@@ -402,48 +472,80 @@ int pf_mitm_get_cert(pf_mitm_t *m, const char *domain,
         return PF_ERR;
     }
 
+    /* Lowercase the domain once for consistent hashing and comparison. */
+    char lower[PF_DOMAIN_MAX + 1];
+    size_t dlen = strnlen(domain, PF_DOMAIN_MAX);
+    for (size_t i = 0; i < dlen; i++)
+        lower[i] = (char)tolower((unsigned char)domain[i]);
+    lower[dlen] = '\0';
+
+    uint64_t h    = fnv1a64_lower(lower);
+    unsigned int base = (unsigned int)(h & CACHE_MASK);
+
     pthread_mutex_lock(&m->cache_lock);
 
-    /* Search cache — hand out OWNED refs (caller must free) */
-    for (int i = 0; i < m->cache_count; i++) {
-        if (strcmp(m->cache[i].domain, domain) == 0) {
-            X509_up_ref(m->cache[i].cert);
-            EVP_PKEY_up_ref(m->cache[i].key);
-            *out_cert = m->cache[i].cert;
-            *out_key  = m->cache[i].key;
+    /* ── Lookup phase: probe up to CACHE_PROBE slots ── */
+    for (int step = 0; step < CACHE_PROBE; step++) {
+        unsigned int idx = (base + (unsigned int)step) & CACHE_MASK;
+        pf_cert_cache_entry_t *e = &m->cache[idx];
+        if (!e->used) break;   /* empty slot — domain not in cache */
+        if (strcmp(e->domain, lower) == 0) {
+            /* Cache hit — bump LRU counter and hand out owned refs. */
+            e->last_used = ++g_tick;
+            X509_up_ref(e->cert);
+            EVP_PKEY_up_ref(e->key);
+            *out_cert = e->cert;
+            *out_key  = e->key;
             pthread_mutex_unlock(&m->cache_lock);
             return PF_OK;
         }
     }
 
-    /* Generate new cert (outside strict necessity but keeps lock held to avoid
-     * duplicate generation races — cert gen ~1ms with EC P-256). */
-    X509 *cert = NULL;
-    EVP_PKEY *key = NULL;
-    if (generate_domain_cert(m, domain, &cert, &key) != PF_OK) {
+    /* ── Miss: generate new cert (lock held to prevent duplicate gen) ── */
+    X509     *cert = NULL;
+    EVP_PKEY *key  = NULL;
+    if (generate_domain_cert(m, lower, &cert, &key) != PF_OK) {
         pthread_mutex_unlock(&m->cache_lock);
         return PF_ERR;
     }
 
-    /* Add to cache — evict oldest if full */
-    int slot;
-    if (m->cache_count < PF_MITM_CERT_CACHE_SIZE) {
-        slot = m->cache_count++;
-    } else {
-        /* Evict oldest (slot 0), shift down */
-        if (m->cache[0].cert) X509_free(m->cache[0].cert);
-        if (m->cache[0].key)  EVP_PKEY_free(m->cache[0].key);
-        memmove(&m->cache[0], &m->cache[1],
-                sizeof(pf_cert_cache_entry_t) * (PF_MITM_CERT_CACHE_SIZE - 1));
-        slot = PF_MITM_CERT_CACHE_SIZE - 1;
+    /* ── Insert: find an empty slot or evict LRU within probe window ── */
+    int   insert_idx = -1;
+    int   lru_idx    = -1;
+    uint64_t lru_tick = UINT64_MAX;
+
+    for (int step = 0; step < CACHE_PROBE; step++) {
+        unsigned int idx = (base + (unsigned int)step) & CACHE_MASK;
+        pf_cert_cache_entry_t *e = &m->cache[idx];
+        if (!e->used) {
+            insert_idx = (int)idx;
+            break;
+        }
+        if (e->last_used < lru_tick) {
+            lru_tick = e->last_used;
+            lru_idx  = (int)idx;
+        }
     }
 
-    snprintf(m->cache[slot].domain, sizeof(m->cache[slot].domain), "%s", domain);
-    m->cache[slot].cert    = cert;
-    m->cache[slot].key     = key;
-    m->cache[slot].created = time(NULL);
+    if (insert_idx < 0) {
+        /* No empty slot in probe window — evict the LRU entry found above. */
+        insert_idx = lru_idx;
+        pf_cert_cache_entry_t *victim = &m->cache[insert_idx];
+        if (victim->cert) X509_free(victim->cert);
+        if (victim->key)  EVP_PKEY_free(victim->key);
+        /* cache_count stays the same — we are reusing an occupied slot. */
+    } else {
+        m->cache_count++;
+    }
 
-    /* Hand out OWNED references — caller must free. This survives concurrent
+    pf_cert_cache_entry_t *slot = &m->cache[insert_idx];
+    memcpy(slot->domain, lower, dlen + 1);
+    slot->cert      = cert;
+    slot->key       = key;
+    slot->last_used = ++g_tick;
+    slot->used      = true;
+
+    /* Hand out OWNED references — caller must free. Safe across concurrent
      * eviction because X509/EVP_PKEY are ref-counted in OpenSSL. */
     X509_up_ref(cert);
     EVP_PKEY_up_ref(key);
@@ -501,7 +603,8 @@ SSL *pf_mitm_wrap_client(pf_mitm_t *m, int client_fd, const char *domain)
         return NULL;
     }
 
-    pf_log_info("mitm: TLS server handshake OK for %s", domain);
+    pf_log_info("mitm: TLS server handshake OK for %s%s", domain,
+                SSL_session_reused(ssl) ? " (resumed)" : "");
     return ssl;
 }
 

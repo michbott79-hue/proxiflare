@@ -41,6 +41,8 @@
 #include "mitm.h"
 #include "http_parser.h"
 #include "body_decode.h"
+#include "capture_queue.h"
+#include "capture_worker.h"
 #include <cJSON.h>
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -98,14 +100,23 @@ static int rules_reload_locked(struct pf_ctx *ctx)
 #define PF_INSPECT_RING_SIZE     5000
 #define PF_INSPECT_BODY_CAP      8192   /* decoded body bytes kept per entry */
 
-static cJSON   *g_inspect_ring[PF_INSPECT_RING_SIZE];
-static int      g_inspect_ring_head  = 0;
-static int      g_inspect_ring_count = 0;
-static uint64_t g_inspect_seq        = 0;
+static cJSON           *g_inspect_ring[PF_INSPECT_RING_SIZE];
+static int              g_inspect_ring_head  = 0;
+static int              g_inspect_ring_count = 0;
+static uint64_t         g_inspect_seq        = 0;
+/* The ring is read by the IPC handler (any thread that services a client)
+ * and written by the capture worker thread. One mutex is sufficient —
+ * reads are rare (user polling) and the writer is single-threaded. */
+static pthread_mutex_t  g_inspect_ring_lock  = PTHREAD_MUTEX_INITIALIZER;
 /* Diagnostic counters — surfaced in inspect.status so the GUI can explain
  * "why is the ring empty" without needing journalctl. */
 static uint64_t g_inspect_skipped_h2 = 0;  /* h2 CLIENT_PREFACE / frames seen */
 static uint64_t g_inspect_parse_fail = 0;  /* bytes received but not parseable */
+
+/* MPSC queue + single consumer thread. Producers are the TPROXY relay
+ * threads via on_inspect_data(); the consumer (capture_worker) does all the
+ * heavy parsing/decompression/cJSON work off the hot path. */
+static pf_capture_queue_t g_capture_queue;
 
 /* Pre-buffer noise filters. Keep the ring dominated by user-meaningful
  * traffic (API, HTML, app XHR) rather than ad/tracker/asset bursts.
@@ -163,80 +174,121 @@ static int content_type_is_asset(const char *ct)
     return 0;
 }
 
-/* Callback from tproxy relay — parse HTTP and store in ring */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * on_inspect_data (producer, hot path)
+ *
+ * Called from the TPROXY relay thread for every TLS-decrypted chunk. The
+ * work here must be O(1) and under a microsecond — the relay thread must
+ * not stall on capture. Everything heavy (HTTP parse, decompression, JSON
+ * construction, ring insertion) runs on the capture_worker thread.
+ *
+ * The sole purpose of this function is:
+ *   1. Fast-reject trivially irrelevant traffic (tracker domains, empty
+ *      packets) so we don't allocate for nothing.
+ *   2. Snapshot the bytes + connection metadata into a heap-allocated
+ *      pf_capture_msg_t.
+ *   3. Enqueue the message.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
                             const pf_connection_t *conn, void *userdata)
 {
     (void)userdata;
     if (!data || len < 4) return;
 
-    /* Pre-parse drop: tracker/ad domain noise. Most hits here are request-side
-     * already but response-side also benefits from the early return. */
+    /* Drop tracker/ad noise early — cheapest possible rejection. */
     if (conn->domain[0] && domain_is_tracker(conn->domain)) return;
+
+    /* Single allocation: message header + inline byte payload. Freed by the
+     * worker after processing. */
+    pf_capture_msg_t *msg = malloc(sizeof(*msg) + len);
+    if (!msg) return;
+    msg->data       = (uint8_t *)(msg + 1);
+    msg->len        = len;
+    msg->is_request = is_request ? 1 : 0;
+    msg->is_tls     = conn->is_tls ? 1 : 0;
+    msg->dst_port   = (int)conn->dst_port;
+    /* Use the client_fd as a per-connection identifier. Good enough for
+     * grouping chunks of the same stream within the worker (client fd is
+     * unique for the lifetime of the connection). */
+    msg->conn_id    = (uint64_t)conn->client_fd;
+    msg->ts_sec     = (uint64_t)time(NULL);
+    snprintf(msg->domain, sizeof(msg->domain), "%s",
+             conn->domain[0] ? conn->domain : conn->dst_ip);
+    snprintf(msg->dst_ip, sizeof(msg->dst_ip), "%s", conn->dst_ip);
+    memcpy(msg->data, data, len);
+
+    pf_capture_queue_push(&g_capture_queue, msg);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * capture_process_msg (consumer, slow path)
+ *
+ * Runs on the capture_worker thread. Owns the message and MUST free it.
+ * This is where the original synchronous parse/decompress/JSON work lives.
+ * ─────────────────────────────────────────────────────────────────────────── */
+static void capture_process_msg(pf_capture_msg_t *m, void *ud)
+{
+    (void)ud;
+    if (!m) return;
+
+    const uint8_t *data = m->data;
+    size_t         len  = m->len;
+    int            is_request = m->is_request;
 
     /* HTTP/2 CLIENT_PREFACE detection. Browsers that negotiated h2 via ALPN
      * send exactly these 24 magic bytes before any frames. Our h1.1 parser
-     * would see this as garbage and silently drop the connection. Count
-     * these so the UI can surface an actionable hint ("X% of traffic is
-     * HTTP/2 — native h2 parsing not yet implemented"). */
+     * would see this as garbage and silently drop the stream. */
     static const uint8_t H2_PREFACE[24] =
         "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     if (is_request && len >= 24 && memcmp(data, H2_PREFACE, 24) == 0) {
         g_inspect_skipped_h2++;
+        free(m);
         return;
     }
 
     pf_http_msg_t msg;
-    int rc;
-
-    if (is_request)
-        rc = pf_http_parse_request((const char *)data, len, &msg);
-    else
-        rc = pf_http_parse_response((const char *)data, len, &msg);
-
+    int rc = is_request
+             ? pf_http_parse_request ((const char *)data, len, &msg)
+             : pf_http_parse_response((const char *)data, len, &msg);
     if (rc != 0) {
-        /* Not a complete HTTP/1.1 message. Could be a partial TCP segment,
-         * an h2 DATA/HEADERS frame on a pre-prefaced stream, or some other
-         * non-HTTP application data. Count so the user can tell. */
+        /* Partial TCP segment, h2 frame, or non-HTTP traffic. */
         g_inspect_parse_fail++;
+        free(m);
         return;
     }
 
-    /* Post-parse drop: static asset content types on responses. Image/font
-     * traffic has no debugging value and floods the ring on page loads. */
+    /* Post-parse drop: static asset content types on responses. */
     if (!is_request) {
         const char *ct = pf_http_get_header(&msg, "Content-Type");
-        if (content_type_is_asset(ct)) return;
+        if (content_type_is_asset(ct)) { free(m); return; }
     }
 
     cJSON *entry = cJSON_CreateObject();
-    cJSON_AddNumberToObject(entry, "seq", (double)(++g_inspect_seq));
-    cJSON_AddNumberToObject(entry, "ts", (double)time(NULL));
-    cJSON_AddStringToObject(entry, "domain", conn->domain[0] ? conn->domain : conn->dst_ip);
-    cJSON_AddStringToObject(entry, "dst_ip", conn->dst_ip);
-    cJSON_AddNumberToObject(entry, "dst_port", (double)conn->dst_port);
-    cJSON_AddBoolToObject(entry, "is_request", is_request ? 1 : 0);
-    cJSON_AddBoolToObject(entry, "tls", conn->is_tls ? 1 : 0);
+    cJSON_AddNumberToObject(entry, "seq",     (double)(++g_inspect_seq));
+    cJSON_AddNumberToObject(entry, "ts",      (double)m->ts_sec);
+    cJSON_AddStringToObject(entry, "domain",  m->domain);
+    cJSON_AddStringToObject(entry, "dst_ip",  m->dst_ip);
+    cJSON_AddNumberToObject(entry, "dst_port",(double)m->dst_port);
+    cJSON_AddBoolToObject  (entry, "is_request", is_request ? 1 : 0);
+    cJSON_AddBoolToObject  (entry, "tls",     m->is_tls ? 1 : 0);
 
     if (is_request) {
-        cJSON_AddStringToObject(entry, "method", msg.method);
-        cJSON_AddStringToObject(entry, "url", msg.url);
+        cJSON_AddStringToObject(entry, "method",  msg.method);
+        cJSON_AddStringToObject(entry, "url",     msg.url);
         cJSON_AddStringToObject(entry, "version", msg.version);
     } else {
-        cJSON_AddNumberToObject(entry, "status", msg.status_code);
+        cJSON_AddNumberToObject(entry, "status",      msg.status_code);
         cJSON_AddStringToObject(entry, "status_text", msg.status_text);
-        cJSON_AddStringToObject(entry, "version", msg.version);
+        cJSON_AddStringToObject(entry, "version",     msg.version);
         const char *ct = pf_http_get_header(&msg, "Content-Type");
         if (ct) cJSON_AddStringToObject(entry, "content_type", ct);
     }
 
-    /* Headers as object */
     cJSON *hdrs = cJSON_CreateObject();
     for (int i = 0; i < msg.header_count; i++)
         cJSON_AddStringToObject(hdrs, msg.headers[i].key, msg.headers[i].value);
     cJSON_AddItemToObject(entry, "headers", hdrs);
 
-    /* Body — decompress (gzip/br/zstd) so the GUI shows readable text. */
     if (msg.body && msg.body_len > 0) {
         const char *enc = pf_http_get_header(&msg, "Content-Encoding");
         char decoded[PF_INSPECT_BODY_CAP + 1];
@@ -250,8 +302,6 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
                 cJSON_AddStringToObject(entry, "body_encoding_orig", enc);
             cJSON_AddBoolToObject(entry, "body_decoded", 1);
         } else {
-            /* Decode failure — preserve raw bytes up to cap so the user sees
-             * *something* and the failing encoding is visible. */
             size_t n = msg.body_len < PF_INSPECT_BODY_CAP
                        ? msg.body_len : PF_INSPECT_BODY_CAP;
             memcpy(decoded, msg.body, n);
@@ -262,15 +312,19 @@ static void on_inspect_data(const uint8_t *data, size_t len, int is_request,
             if (enc) cJSON_AddStringToObject(entry, "body_encoding_orig", enc);
         }
     }
-
     cJSON_AddNumberToObject(entry, "content_length", (double)msg.content_length);
 
-    /* Store in ring buffer */
+    /* Insert into the visible ring under its own mutex so IPC readers
+     * (inspect.list / inspect.get on other threads) never see a torn entry. */
+    pthread_mutex_lock(&g_inspect_ring_lock);
     if (g_inspect_ring[g_inspect_ring_head])
         cJSON_Delete(g_inspect_ring[g_inspect_ring_head]);
     g_inspect_ring[g_inspect_ring_head] = entry;
     g_inspect_ring_head = (g_inspect_ring_head + 1) % PF_INSPECT_RING_SIZE;
     if (g_inspect_ring_count < PF_INSPECT_RING_SIZE) g_inspect_ring_count++;
+    pthread_mutex_unlock(&g_inspect_ring_lock);
+
+    free(m);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2101,6 +2155,17 @@ int main(int argc, char *argv[])
     if (pf_ssh_pool_init(&ctx->ssh_pool) != PF_OK)
         pf_log_warn("ssh_pool_init failed — SSH proxies will not work");
 
+    /* Capture queue + worker — relay threads enqueue bytes here, the worker
+     * drains and does parse/decompress/JSON off the hot path. Must be live
+     * before the tproxy inspect callback is wired. */
+    if (pf_capture_queue_init(&g_capture_queue) != 0) {
+        pf_log_error("capture_queue_init failed — capture disabled");
+    } else if (pf_capture_worker_start(&g_capture_queue,
+                                       capture_process_msg, NULL) != 0) {
+        pf_log_error("capture_worker_start failed");
+        pf_capture_queue_close(&g_capture_queue);
+    }
+
     /* 5g-bis. MITM engine */
     if (pf_mitm_init(&ctx->mitm) != PF_OK) {
         pf_log_warn("mitm_init failed — HTTPS interception disabled");
@@ -2378,6 +2443,11 @@ int main(int argc, char *argv[])
 
 shutdown:
     pf_log_info("Shutting down...");
+
+    /* Stop the capture worker BEFORE tearing down MITM/tproxy so any in-flight
+     * messages are either processed or cleanly dropped. */
+    pf_capture_worker_stop();
+    pf_capture_queue_close(&g_capture_queue);
 
     /* ── 9. Cleanup in reverse order ───────────────────────────────────── */
     if (ctx->epoll_fd >= 0)

@@ -264,8 +264,19 @@ pub fn dns_leak_status(client: State<DaemonClient>) -> Result<Value, String> {
 // ── Inspect (MITM) ──────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn inspect_list(client: State<DaemonClient>, since_seq: u64) -> Result<Value, String> {
-    client.send_request("inspect.list", json!({ "since_seq": since_seq }))
+pub fn inspect_list(
+    client: State<DaemonClient>,
+    since_seq: u64,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let limit = limit.unwrap_or(500);
+    client.send_request("inspect.list",
+        json!({ "since_seq": since_seq, "limit": limit }))
+}
+
+#[tauri::command]
+pub fn inspect_get(client: State<DaemonClient>, seq: u64) -> Result<Value, String> {
+    client.send_request("inspect.get", json!({ "seq": seq }))
 }
 
 #[tauri::command]

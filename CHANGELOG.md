@@ -9,6 +9,38 @@ Format follows [Semantic Versioning](https://semver.org/):
 
 ---
 
+## [0.2.3-alpha] — 2026-04-14
+
+### Fixed — GUI hang "ProxiFlare is not responding"
+Root cause: `inspect.list` returned the full ring (up to 5000 entries ×
+up to 8 KB decoded body) on every 2 s poll — ~40 MB of JSON that Tauri
+deserialised on the renderer's main thread, freezing the UI.
+
+Rewrote the capture IPC path around a clean list/detail split:
+
+1. **Daemon `inspect.list`** now returns SLIM summary rows only — no
+   headers, no body — and is hard-capped at `limit` entries per call
+   (default 500, max 1000). Rows are picked newest-first so under cap
+   we keep the most recent, not the oldest. Payload per poll: ≤200 KB.
+2. **Daemon `inspect.get(seq)`** — new endpoint that returns the FULL
+   entry (headers + body + all fields) for one seq. Called on row click.
+3. **GUI poll guard**: skip if a previous poll is still pending
+   (`pollInFlight` ref) — prevents pile-up while the daemon is busy.
+4. **GUI visibility guard**: skip poll when `document.hidden` (user on
+   another tab or window minimised). Resume immediately on
+   `visibilitychange`.
+5. **GUI poll interval** 2 s → 3 s, and local entry cap 5000 → 2000
+   (summary rows are cheap enough; React stays responsive).
+6. **Row click** loads the full entry lazily via `inspect_get` so the
+   detail panel shows headers + body on demand. Spinner surfaced while
+   fetching.
+
+Net effect: poll payload reduced ~200× (~40 MB → ~200 KB); main-thread
+deserialise time drops from seconds to milliseconds; the GUI stays
+responsive even under heavy capture load.
+
+---
+
 ## [0.2.2-alpha] — 2026-04-14
 
 ### Fixed — navigation slowness + low capture count on DAZN

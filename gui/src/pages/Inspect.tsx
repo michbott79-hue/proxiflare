@@ -84,6 +84,8 @@ export default function Inspect() {
   const statusRef = useRef<HTMLDivElement>(null);
   const seqRef = useRef(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollInFlight = useRef(false);   /* drop poll() calls while one is pending */
+  const [detailLoading, setDetailLoading] = useState(false);
 
   /* Close dropdowns on outside click */
   useEffect(() => {
@@ -121,12 +123,19 @@ export default function Inspect() {
   }, []);
 
   const poll = useCallback(async () => {
+    /* Skip if a previous poll is still in-flight — prevents pile-up while
+     * the daemon is busy serialising large payloads. */
+    if (pollInFlight.current) return;
+    /* Skip when the window is hidden — no point spending CPU + IPC round
+     * trips when the user isn't looking. */
+    if (typeof document !== 'undefined' && document.hidden) return;
+    pollInFlight.current = true;
     try {
-      const raw = await api.inspectList(seqRef.current);
+      /* Bounded by the daemon at 500 entries max per call → small payload. */
+      const raw = await api.inspectList(seqRef.current, 500);
       if (Array.isArray(raw) && raw.length > 0) {
-        /* Daemon-restart detection: if any returned seq is LESS than what we
-         * already saw, the daemon restarted (seq resets to 1). Wipe local
-         * state and start over from seq 0 so nothing is silently skipped. */
+        /* Daemon-restart detection: if any returned seq is LESS than the GUI's
+         * last seen, the daemon restarted (seq resets to 1). Wipe and rebuild. */
         const minSeq = Math.min(...raw.map((e: InspectEntry) => e.seq || 0));
         if (seqRef.current > 0 && minSeq < seqRef.current) {
           seqRef.current = 0;
@@ -137,15 +146,16 @@ export default function Inspect() {
         }
         setEntries(prev => {
           const merged = [...prev, ...raw];
-          /* Keep the GUI in sync with the daemon ring (5000 entries).
-           * Older entries scroll off the back exactly as on the daemon side. */
-          if (merged.length > 5000) return merged.slice(-5000);
+          /* Local cap below the daemon ring (5000) to keep React-tree cheap
+           * and memory bounded at ~2-3 MB for summary rows. */
+          if (merged.length > 2000) return merged.slice(-2000);
           return merged;
         });
         const maxSeq = Math.max(...raw.map((e: InspectEntry) => e.seq || 0));
         if (maxSeq > seqRef.current) seqRef.current = maxSeq;
       }
     } catch { /* daemon may not support it */ }
+    finally { pollInFlight.current = false; }
   }, []);
 
   useEffect(() => {
@@ -153,10 +163,28 @@ export default function Inspect() {
     /* Only poll when capture is active — prevents hammering daemon IPC */
     if (status?.enabled) {
       poll();
-      pollRef.current = setInterval(poll, 2000);
+      pollRef.current = setInterval(poll, 3000);
     }
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   }, [loadStatus, poll, status?.enabled]);
+
+  /* Resume polling when the window becomes visible again. */
+  useEffect(() => {
+    function onVis() { if (!document.hidden) poll(); }
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [poll]);
+
+  /* Click a row → load full entry (headers + body) on demand. */
+  const handleSelect = useCallback(async (e: InspectEntry) => {
+    setSelected(e);
+    setDetailLoading(true);
+    try {
+      const full = await api.inspectGet(e.seq);
+      if (full) setSelected(full as InspectEntry);
+    } catch { /* keep the summary */ }
+    finally { setDetailLoading(false); }
+  }, []);
 
   async function handleToggle() {
     setToggling(true);
@@ -363,7 +391,7 @@ export default function Inspect() {
                 return (
                   <tr
                     key={e.seq}
-                    onClick={() => setSelected(e)}
+                    onClick={() => handleSelect(e)}
                     className={`border-b border-[#2d3348] cursor-pointer transition-colors hover:bg-[#232733] ${
                       selected?.seq === e.seq ? 'bg-[#6366f1]/10' : 'bg-[#1a1d27]'
                     }`}
@@ -402,7 +430,10 @@ export default function Inspect() {
         {selected && (
           <div className="w-[400px] shrink-0 overflow-auto rounded-lg border border-[#2d3348] bg-[#1a1d27] p-4">
             <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">Request Details</h3>
+              <h3 className="text-sm font-semibold">
+                Request Details
+                {detailLoading && <span className="ml-2 text-[10px] text-[#64748b]">loading…</span>}
+              </h3>
               <button
                 onClick={() => setSelected(null)}
                 className="text-xs text-[#64748b] hover:text-[#e2e8f0]"

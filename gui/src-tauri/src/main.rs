@@ -97,6 +97,7 @@ fn main() {
             commands::list_system_apps,
             commands::log_recent,
             commands::inspect_list,
+            commands::inspect_get,
             commands::inspect_enable,
             commands::inspect_disable,
             commands::inspect_status,

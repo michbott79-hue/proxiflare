@@ -1486,23 +1486,96 @@ static cJSON *pf_handle_request(pf_ctx_t *ctx, const char *method,
         }
         cJSON_AddItemToObject(resp, "result", arr);
 
-    /* ── inspect.list ──────────────────────────────────────────────────── */
+    /* ── inspect.list ──────────────────────────────────────────────────── *
+     *
+     * Returns a LIGHTWEIGHT summary per entry — no headers, no body — plus a
+     * hard cap on entries per call. This keeps the IPC payload small enough
+     * that the Tauri IPC deserializer never blocks the GUI main thread, even
+     * under heavy capture load.
+     *
+     * Params:
+     *   since_seq (uint)   — only entries with seq > since_seq
+     *   limit     (uint)   — cap on rows returned (default 500, max 1000)
+     *
+     * Response fields per entry:
+     *   seq, ts, domain, dst_ip, dst_port, is_request, tls,
+     *   method, url, version, status, status_text, content_type,
+     *   body_len, content_length
+     * ─────────────────────────────────────────────────────────────────────── */
     } else if (strcmp(method, "inspect.list") == 0) {
         int since_seq = 0;
-        cJSON *since = params ? cJSON_GetObjectItem(params, "since_seq") : NULL;
-        if (since) since_seq = (int)since->valuedouble;
+        int limit     = 500;
+        if (params) {
+            cJSON *since = cJSON_GetObjectItem(params, "since_seq");
+            cJSON *lim   = cJSON_GetObjectItem(params, "limit");
+            if (since) since_seq = (int)since->valuedouble;
+            if (lim)   limit     = (int)lim->valuedouble;
+        }
+        if (limit <= 0 || limit > 1000) limit = 500;
 
+        /* Walk newest-first so that when capped we return the MOST RECENT
+         * entries (the oldest-visible ones are dropped, not the newest). */
         cJSON *arr = cJSON_CreateArray();
+        int added = 0;
+        for (int ii = g_inspect_ring_count - 1; ii >= 0 && added < limit; ii--) {
+            int idx = (g_inspect_ring_head - g_inspect_ring_count + ii + PF_INSPECT_RING_SIZE)
+                      % PF_INSPECT_RING_SIZE;
+            cJSON *src = g_inspect_ring[idx];
+            if (!src) continue;
+            cJSON *seq_item = cJSON_GetObjectItem(src, "seq");
+            if (!seq_item || seq_item->valuedouble <= since_seq) continue;
+
+            /* Build a slim clone — copy only the fields needed for the list
+             * view. Full headers + body are fetched lazily via inspect.get. */
+            cJSON *sum = cJSON_CreateObject();
+            const char *slim_keys[] = {
+                "seq", "ts", "domain", "dst_ip", "dst_port",
+                "is_request", "tls", "method", "url", "version",
+                "status", "status_text", "content_type",
+                "body_len", "content_length", NULL
+            };
+            for (int k = 0; slim_keys[k]; k++) {
+                cJSON *v = cJSON_GetObjectItem(src, slim_keys[k]);
+                if (v) cJSON_AddItemToObject(sum, slim_keys[k],
+                                             cJSON_Duplicate(v, 1));
+            }
+            cJSON_AddItemToArray(arr, sum);
+            added++;
+        }
+        /* Reverse in-place so the GUI sees oldest-first as before. */
+        int n = cJSON_GetArraySize(arr);
+        cJSON *reversed = cJSON_CreateArray();
+        for (int i = n - 1; i >= 0; i--) {
+            cJSON *it = cJSON_DetachItemFromArray(arr, i);
+            if (it) cJSON_AddItemToArray(reversed, it);
+        }
+        cJSON_Delete(arr);
+        cJSON_AddItemToObject(resp, "result", reversed);
+
+    /* ── inspect.get ────────────────────────────────────────────────────── *
+     * Full entry (headers + body + all fields) for one seq. Called by the
+     * GUI detail panel on row click — keeps inspect.list tiny.
+     * ─────────────────────────────────────────────────────────────────────── */
+    } else if (strcmp(method, "inspect.get") == 0) {
+        cJSON *seq_v = params ? cJSON_GetObjectItem(params, "seq") : NULL;
+        double want = seq_v ? seq_v->valuedouble : 0;
+        cJSON *hit = NULL;
         for (int ii = 0; ii < g_inspect_ring_count; ii++) {
             int idx = (g_inspect_ring_head - g_inspect_ring_count + ii + PF_INSPECT_RING_SIZE)
                       % PF_INSPECT_RING_SIZE;
-            if (g_inspect_ring[idx]) {
-                cJSON *seq_item = cJSON_GetObjectItem(g_inspect_ring[idx], "seq");
-                if (seq_item && seq_item->valuedouble > since_seq)
-                    cJSON_AddItemToArray(arr, cJSON_Duplicate(g_inspect_ring[idx], 1));
+            cJSON *src = g_inspect_ring[idx];
+            if (!src) continue;
+            cJSON *seq_item = cJSON_GetObjectItem(src, "seq");
+            if (seq_item && seq_item->valuedouble == want) {
+                hit = cJSON_Duplicate(src, 1);
+                break;
             }
         }
-        cJSON_AddItemToObject(resp, "result", arr);
+        if (hit) {
+            cJSON_AddItemToObject(resp, "result", hit);
+        } else {
+            cJSON_AddStringToObject(resp, "error", "not found");
+        }
 
     /* ── inspect.enable ─────────────────────────────────────────────────── */
     } else if (strcmp(method, "inspect.enable") == 0) {

@@ -197,13 +197,20 @@ export async function logRecent(sinceSeq: number): Promise<LogEntryRaw[]> {
 
 // ── Inspect (MITM HTTP interception) ───────────────────────────────────────
 
-export async function inspectList(sinceSeq: number): Promise<any[]> {
-  /* Daemon returns {"result": {"result": [...]}}. Tauri's send_request
-   * unwraps the outer layer; we still need to unwrap the inner `result`
-   * field. Mirror the same defensive chain used in inspectStatus. */
-  const raw = await invoke<any>('inspect_list', { sinceSeq });
+export async function inspectList(sinceSeq: number, limit = 500): Promise<any[]> {
+  /* Daemon returns {"result": [...]} with slim summary rows (no headers/body).
+   * Tauri's send_request strips the outer layer; we unwrap the inner result. */
+  const raw = await invoke<any>('inspect_list', { sinceSeq, limit });
   const arr = raw?.result ?? raw;
   return Array.isArray(arr) ? arr : [];
+}
+
+/** Fetch the FULL entry (headers + body) for a given seq. Called lazily when
+ * the user selects a row — keeps the list-poll payload tiny. */
+export async function inspectGet(seq: number): Promise<any | null> {
+  const raw = await invoke<any>('inspect_get', { seq });
+  const obj = raw?.result ?? raw;
+  return obj && typeof obj === 'object' ? obj : null;
 }
 
 export async function inspectEnable(): Promise<void> {
